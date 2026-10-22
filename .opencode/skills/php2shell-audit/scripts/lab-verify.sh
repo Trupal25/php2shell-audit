@@ -377,6 +377,268 @@ EOF
   stop_server "$S3"
 fi
 
+# ---- url workflow (offline + local mock server) --------------------------------
+URL_SERVER_PY="$tmpdir/url_server.py"
+cat > "$URL_SERVER_PY" <<'PY'
+import os, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+powered = os.environ.get("FAKE_X_POWERED_BY", "-")
+origin = os.environ.get("FAKE_SERVER", "Apache/2.4.54 (Debian)")
+post_code = int(os.environ.get("FAKE_POST_STATUS", "200"))
+mode = os.environ.get("FAKE_MODE", "ok")
+big_kb = int(os.environ.get("FAKE_BIG_KB", "3072"))
+sleep_s = float(os.environ.get("FAKE_SLEEP", "6"))
+port = int(sys.argv[1])
+
+class H(BaseHTTPRequestHandler):
+    server_version = origin
+    sys_version = ""
+    def do_GET(self):
+        if mode == "redirect-good" and self.path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.end_headers()
+            return
+        if mode == "redirect-loop":
+            self.send_response(302)
+            self.send_header("Location", "/loop")
+            self.end_headers()
+            return
+        if mode == "redirect-evil":
+            self.send_response(302)
+            self.send_header("Location", "http://user:pass@127.0.0.1:1/")
+            self.end_headers()
+            return
+        if mode == "big":
+            self.send_response(200)
+            self.send_header("Content-Length", str(big_kb * 1024))
+            if powered and powered != "-":
+                self.send_header("X-Powered-By", powered)
+            self.end_headers()
+            chunk = b"x" * 65536
+            for _ in range(big_kb * 1024 // 65536 + 1):
+                self.wfile.write(chunk)
+            return
+        if mode == "slow":
+            time.sleep(sleep_s)
+        self.send_response(200)
+        if powered and powered != "-":
+            self.send_header("X-Powered-By", powered)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(b'<html><a href="index.php">home</a></html>')
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        self.rfile.read(n)
+        self.send_response(post_code)
+        self.end_headers()
+        self.wfile.write(b"no")
+    def log_message(self, *a):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+
+start_url_server() { # start_url_server PORT MODE X_POWERED_BY SLEEP_S POST_STATUS
+  local port="$1" m="$2" pw="$3" sl="${4:-0}" pc="${5:-200}"
+  FAKE_MODE="$m" FAKE_X_POWERED_BY="$pw" FAKE_SLEEP="$sl" FAKE_POST_STATUS="$pc" \
+    python3 "$URL_SERVER_PY" "$port" >/dev/null 2>&1 &
+  local pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$port/" 2>/dev/null && break
+    sleep 0.3
+  done
+  echo "$pid"
+}
+
+# guard-only (offline, no server): authorization decisions
+python3 "$HERE/url_guard.py" --url http://127.0.0.1:19001/ >/dev/null 2>&1
+expect "url_guard loopback without --lab -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url http://127.0.0.1:19001/ --lab >/dev/null 2>&1
+expect "url_guard loopback with --lab -> authorized" "0" "$?"
+python3 "$HERE/url_guard.py" --url http://user:pass@127.0.0.1:19001/ --lab >/dev/null 2>&1
+expect "url_guard embedded credentials -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url ftp://127.0.0.1/ --lab >/dev/null 2>&1
+expect "url_guard unsupported scheme -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url http://169.254.169.254/latest/ >/dev/null 2>&1
+expect "url_guard metadata endpoint without --lab -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url http://169.254.169.254/latest/ --lab >/dev/null 2>&1
+expect "url_guard metadata endpoint with --lab -> authorized" "0" "$?"
+printf 'other.example\n' > "$tmpdir/scope-miss.txt"
+python3 "$HERE/url_guard.py" --url http://8.8.8.8/ --scope-file "$tmpdir/scope-miss.txt" >/dev/null 2>&1
+expect "url_guard public IP not in scope -> refused" "2" "$?"
+printf '8.8.8.8\n' > "$tmpdir/scope-hit.txt"
+python3 "$HERE/url_guard.py" --url http://8.8.8.8/ --scope-file "$tmpdir/scope-hit.txt" >/dev/null 2>&1
+expect "url_guard public IP in scope -> authorized (no contact)" "0" "$?"
+python3 "$HERE/url_guard.py" --base https://a.example/ --location http://a.example/ok --scope-file "$tmpdir/scope-hit.txt" >/dev/null 2>&1
+expect "url_guard https->http redirect downgrade -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url 'http://[fe80::1%25eth0]/' --lab >/dev/null 2>&1
+expect "url_guard scoped IPv6 zone id -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url 'http://127.0.0.1/\evil' --lab >/dev/null 2>&1
+expect "url_guard backslash in URL -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url http://127.0.0.1:port/ --lab >/dev/null 2>&1
+expect "url_guard malformed port -> refused" "2" "$?"
+python3 "$HERE/url_guard.py" --url http://no-such-host-4671.example/ --scope-file "$tmpdir/scope-hit.txt" >/dev/null 2>&1
+expect "url_guard unresolvable public host -> refused" "2" "$?"
+
+if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  # scenario 1: valid authorized URL -> structured report
+  SP="$(start_url_server 18291 ok "PHP/8.4.26")"
+  bash "$HERE/assess-url.sh" http://127.0.0.1:18291/ --lab --out "$tmpdir/url-ok" --json \
+    > "$tmpdir/url-ok.json" 2>/dev/null
+  rc_ok=$?
+  expect "assess-url valid run exit 0" "0" "$rc_ok"
+  expect "assess-url report exists" "yes" "$([[ -s "$tmpdir/url-ok/report.md" ]] && echo yes || echo no)"
+  expect "assess-url assessment schema/kind" "1 url-assessment" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["schema"], d["kind"])' "$tmpdir/url-ok/assessment.json")"
+  expect "assess-url state ok" "ok" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-ok.json")"
+  expect "assess-url finds version hint" "8.4.26" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_evidence"]["version"])' "$tmpdir/url-ok.json")"
+  expect "assess-url pin recorded per request" "127.0.0.1" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["collection"]["requests"][0]["pin"])' "$tmpdir/url-ok.json")"
+  expect "assess-url report says version is not proof" "yes" \
+    "$(grep -q 'not proof' "$tmpdir/url-ok/report.md" && echo yes || echo no)"
+  expect "assess-url findings.csv produced" "yes" \
+    "$([[ -s "$tmpdir/url-ok/findings.csv" ]] && echo yes || echo no)"
+  "$HERE/assess-url.sh" --verify "$tmpdir/url-ok" >/dev/null 2>&1
+  expect "assess-url verify ok" "0" "$?"
+
+  # scenario 5: insufficient evidence never produces RCE-CONFIRMED
+  expect "assess-url URL-only rce_state never confirmed" "yes" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("yes" if d["rce"]["state"] != "RCE-CONFIRMED" else "no")' "$tmpdir/url-ok.json")"
+  expect "assess-url report says RCE not established" "yes" \
+    "$(grep -q 'not established' "$tmpdir/url-ok/report.md" && echo yes || echo no)"
+
+  # edge probe FAIL (POST returns 200) -> P0 exposure in findings
+  expect "assess-url edge probe FAIL honored" "FAIL" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["collection"]["edge_result"])' "$tmpdir/url-ok.json")"
+  expect "assess-url edge-fail -> findings P0" "P0" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("priority"))' "$tmpdir/url-ok/findings.jsonl")"
+
+  # edge probe PASS (POST returns 413) -> decisive control recognized
+  SEDGE="$(start_url_server 18292 ok "PHP/8.4.26" 0 413)"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18292/ --lab --out "$tmpdir/url-pass" --json \
+    > "$tmpdir/url-pass.json" 2>/dev/null
+  expect "assess-url edge-pass exit 0" "0" "$?"
+  expect "assess-url edge PASS honored" "PASS" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["collection"]["edge_result"])' "$tmpdir/url-pass.json")"
+  expect "assess-url edge-pass -> findings blocked not P0" "P3" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("priority"))' "$tmpdir/url-pass/findings.jsonl")"
+  stop_server "$SEDGE"
+  stop_server "$SP"
+
+  # scenario 2: unreachable target -> useful failure report
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:9/ --lab --out "$tmpdir/url-unreach" --json > "$tmpdir/url-unreach.json" 2>/dev/null
+  expect "assess-url unreachable exit 3" "3" "$?"
+  expect "assess-url unreachable state" "unreachable" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-unreach.json")"
+  expect "assess-url unreachable still writes a failure report" "yes" \
+    "$([[ -s "$tmpdir/url-unreach/report.md" ]] && grep -q 'not supported by this run' "$tmpdir/url-unreach/report.md" && echo yes || echo no)"
+
+  # scenario 3: redirect to prohibited destination refused without contacting it
+  SEV="$(start_url_server 18293 redirect-evil "-")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18293/ --lab --out "$tmpdir/url-evil" --json > "$tmpdir/url-evil.json" 2>/dev/null
+  expect "assess-url unsafe redirect exit 3" "3" "$?"
+  expect "assess-url unsafe redirect state" "aborted-unsafe-redirect" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-evil.json")"
+  expect "assess-url unsafe redirect sent only one request" "1" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["collection"]["requests_made"])' "$tmpdir/url-evil.json")"
+  expect "assess-url unsafe redirect reason names credentials" "yes" \
+    "$(grep -q 'credentials' "$tmpdir/url-evil/raw/guard-hop-01.json" && echo yes || echo no)"
+  stop_server "$SEV"
+
+  # valid redirect must be followed and re-authorized
+  SGO="$(start_url_server 18294 redirect-good "PHP/8.4.26")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18294/ --lab --out "$tmpdir/url-redir" --json > "$tmpdir/url-redir.json" 2>/dev/null
+  expect "assess-url valid redirect exit 0" "0" "$?"
+  expect "assess-url valid redirect followed" "1" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["collection"]["redirects_followed"])' "$tmpdir/url-redir.json")"
+  expect "assess-url valid redirect finds version at final URL" "8.4.26" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_evidence"]["version"])' "$tmpdir/url-redir.json")"
+  stop_server "$SGO"
+
+  # redirect budget honored
+  SLP="$(start_url_server 18295 redirect-loop "-")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18295/ --lab --max-redirects 2 \
+    --out "$tmpdir/url-loop" --json > "$tmpdir/url-loop.json" 2>/dev/null
+  expect "assess-url redirect budget exit 3" "3" "$?"
+  expect "assess-url redirect budget state" "aborted-redirect-limit" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-loop.json")"
+  stop_server "$SLP"
+
+  # oversized response bounded
+  SBG="$(start_url_server 18296 big "PHP/8.4.26")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18296/ --lab --out "$tmpdir/url-big" --json > "$tmpdir/url-big.json" 2>/dev/null
+  expect "assess-url oversized response exit 3" "3" "$?"
+  expect "assess-url oversized state" "aborted-oversized-response" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-big.json")"
+  expect "assess-url oversized limit recorded" "yes" \
+    "$(grep -q 'response-size' "$tmpdir/url-big/assessment.json" && echo yes || echo no)"
+  stop_server "$SBG"
+
+  # total request timeout bounded
+  SSL="$(start_url_server 18297 slow "PHP/8.4.26" 6)"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18297/ --lab --timeout 1 \
+    --out "$tmpdir/url-slow" --json > "$tmpdir/url-slow.json" 2>/dev/null
+  expect "assess-url timeout exit 3" "3" "$?"
+  expect "assess-url timeout state" "unreachable" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$tmpdir/url-slow.json")"
+  stop_server "$SSL"
+
+  # scenario 4: missing/spoofed version headers must stay hints
+  SNV="$(start_url_server 18298 ok "-")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18298/ --lab --out "$tmpdir/url-nover" --json > "$tmpdir/url-nover.json" 2>/dev/null
+  expect "assess-url missing version -> no version claim" "yes" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("yes" if not d["version_evidence"]["version"] and not d["version_evidence"]["definitive"] else "no")' "$tmpdir/url-nover.json")"
+  expect "assess-url missing-version report honest" "yes" \
+    "$(grep -q 'no PHP signal' "$tmpdir/url-nover/report.md" && echo yes || echo no)"
+  stop_server "$SNV"
+
+  SSF="$(start_url_server 18299 ok "PHP/9.9.9")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18299/ --lab --out "$tmpdir/url-spoof" --json > "$tmpdir/url-spoof.json" 2>/dev/null
+  expect "assess-url spoofed hint recorded without definitive flag" "9.9.9 False" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d["version_evidence"]; print(v["version"], v["definitive"])' "$tmpdir/url-spoof.json")"
+  stop_server "$SSF"
+
+  # option 6: artifact tampering detection
+  cp -r "$tmpdir/url-ok" "$tmpdir/url-tamper"
+  echo "tampered" >> "$tmpdir/url-tamper/raw/hop-00.headers"
+  "$HERE/assess-url.sh" --verify "$tmpdir/url-tamper" >/dev/null 2>&1
+  expect "assess-url verify detects tampering" "5" "$?"
+
+  # optional RCE evidence must go through the existing validator, unchanged
+  SRCE="$(start_url_server 18301 ok "PHP/8.4.26")"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:18301/ --lab --asset lab-01 \
+    --rce-evidence "$RCE/confirm.json" --markers "$RCE/marker.txt" \
+    --out "$tmpdir/url-rce" --json > "$tmpdir/url-rce.json" 2>/dev/null
+  expect "assess-url rce-evidence run exit 0" "0" "$?"
+  expect "assess-url rce_state from validator" "RCE-CONFIRMED" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rce"]["state"])' "$tmpdir/url-rce.json")"
+  expect "assess-url rce report keeps validator state" "yes" \
+    "$(grep -q 'RCE-CONFIRMED' "$tmpdir/url-rce/report.md" && echo yes || echo no)"
+  stop_server "$SRCE"
+
+  # CLI validation failures (no request may leave the machine)
+  bash "$HERE/assess-url.sh" https://198.51.100.7/ >/dev/null 2>&1
+  expect "assess-url public target without scope -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:1/ --out "$tmpdir/url-nolab" >/dev/null 2>&1
+  expect "assess-url loopback without --lab -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" --url ftp://127.0.0.1/ --lab >/dev/null 2>&1
+  expect "assess-url ftp scheme -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" --url 'http://user:pass@127.0.0.1:1/' --lab >/dev/null 2>&1
+  expect "assess-url embedded credentials -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" >/dev/null 2>&1
+  expect "assess-url missing URL -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:1/ --lab --timeout bogus >/dev/null 2>&1
+  expect "assess-url invalid --timeout -> exit 2" "2" "$?"
+  bash "$HERE/assess-url.sh" --url http://127.0.0.1:1/ --lab --exposure banana >/dev/null 2>&1
+  expect "assess-url invalid --exposure -> exit 2" "2" "$?"
+else
+  echo "skip    url workflow tests (curl or python3 missing)"
+fi
+
 echo
 echo "----"
 if [[ "$FAIL" -eq 0 ]]; then

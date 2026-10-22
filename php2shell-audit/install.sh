@@ -30,5 +30,5 @@ mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 cp -a "$HERE" "$DEST"
 rm -rf "$DEST/scripts/__pycache__"
-chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/report.py
+chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/report.py "$DEST"/scripts/url_guard.py "$DEST"/scripts/url-report.py
 printf 'installed %s -> %s\n' "$HERE" "$DEST"

@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.4.0 — 2026-10-22
+
+- `assess-url.sh`: full URL-based remote assessment workflow. One authorized URL
+  in → `assessment.json` (schema 1, kind `url-assessment`), `report.md`,
+  `findings.jsonl`, `findings.csv`, plus raw per-request captures. Pipeline:
+  SSRF-safe authorization → bounded redirect-validated GET → one bounded
+  long-key edge POST → derived `fingerprint.json`/`edge.json` → `chain.sh`
+  verdict → optional `--rce-evidence` through the unchanged `rce-validate.sh`
+  → report. Flags: positional URL or `--url`, `--out`, `--asset`,
+  `--scope-file`, `--lab`, `--exposure`, `--connect-timeout`, `--timeout`,
+  `--max-redirects`, `--max-bytes`, `--rce-evidence`, `--markers`, `--verify`,
+  `--json`. Exit codes: 0 report generated; 2 invalid/unauthorized/unsafe
+  (no request sent); 3 collection did not complete (unreachable, timeout,
+  refused redirect, oversize, redirect limit) with a truthful failure report;
+  4 internal error; 5 tampering/contradiction (`--verify` only).
+  The old one-shot decision strings (`P0-EXPOSED`, …) are replaced by the same
+  chain verdict vocabulary the rest of the skill uses (`CHAIN-OPEN`, …) plus a
+  per-asset priority in `findings.jsonl`.
+- `url_guard.py` (new): pre-flight URL authorization without contacting the
+  target. Strict http/https parsing, refusal of credentials/whitespace/
+  control characters, scope-file check **before** DNS resolution
+  (`*.wildcard` + exact entries), address classification: loopback, private,
+  link-local, unique-local, multicast, reserved, unspecified, and cloud
+  metadata (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`) are all
+  non-global and require `--lab`; public hosts require the scope file even
+  with `--lab`; picks one pinned address per request for `curl --resolve`;
+  refuses `https`→`http` redirect downgrades.
+- `url-report.py` (new): renders the human report from `assessment.json`;
+  reuses `report.py` normalization/rendering for the standard findings table
+  and adds scope & authorization, safety model, outcome, request table, chain
+  verdict with preconditions, RCE assessment (URL-only runs can never produce
+  `RCE-CONFIRMED`), SHA-256 provenance, tested/not-tested, next steps, and
+  limitations. Records the generated `report.md`/`findings.csv` hashes back
+  into `assessment.json` (`generated_sha256`).
+- Integrity: every raw and derived artifact is SHA-256-hashed into
+  `assessment.json`; `assess-url.sh --verify DIR` recomputes and re-checks
+  consistency (exit 5 on tampering or contradiction, e.g. an unbacked
+  `RCE-CONFIRMED`).
+- Safety model: DNS resolved once and pinned (`--resolve`), redirects
+  re-authorized per hop with the guard, TLS verification never disabled, no
+  credentials/cookies/session tokens/netrc or environment proxies sent
+  (`--noproxy '*'`, `--netrc-file /dev/null`), body caps with truncation,
+  per-request connect/total timeouts, redirect budget; a refused hop never
+  causes a request to the refused destination.
+- Tests: `lab-verify.sh` extended from 38 to 98 offline assertions — 14
+  `url_guard.py` authorization cases (loopback without/with `--lab`, credentials, scheme,
+  metadata endpoint, scope miss/hit, redirect downgrade, malformed port,
+  unresolvable host) and 46 workflow cases over a local ThreadingHTTPServer
+  mock (valid run incl. `--verify`, edge FAIL→P0 and edge PASS→P3, unreachable
+  failure report, rejected unsafe redirect that never contacts the target,
+  valid redirect follow, redirect budget, oversized-response abort, timeout,
+  missing-version honesty, spoofed `PHP/9.9.9` hint-only, tamper detection,
+  optional RCE evidence honored through the validator, CLI validation).
+  No internet, no Docker, no PHP required.
+- `install.sh`: chmod extended to the new Python entry points.
+- Docs: README gains the "Remote URL assessment" section (usage, exit codes,
+  safety model, artifact table, boundary claims); SKILL.md gains Phase 5b and
+  the updated fast-path command; VERSION → 1.4.0.
+
 ## 1.3.0 — 2026-10-22
 
 - `lab-repro.sh`: real Docker Apache/mod_php reproduction. Sends one bounded

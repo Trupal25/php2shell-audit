@@ -18,8 +18,10 @@ cd php2shell-audit
 # One decision, local host
 bash scripts/triage.sh --local
 
-# One URL: fingerprint + one edge probe
-bash scripts/assess-url.sh --url https://target/ --scope-file scope.txt
+# One URL: full safe assessment (fingerprint + edge + chain verdict + report)
+bash scripts/assess-url.sh https://target/ --scope-file scope.txt --asset web-01 --out url-audit-web-01
+# loopback/private lab targets instead use --lab:
+bash scripts/assess-url.sh http://127.0.0.1:8080/ --lab
 
 # Fleet decision (one host per line)
 bash scripts/triage.sh --hosts scope.txt --scope-file scope.txt --json > fleet.jsonl
@@ -46,7 +48,78 @@ bash scripts/rce-validate.sh --evidence rce-evidence.json \
   --markers rce-marker.txt --asset lab-web-01
 ```
 
-Private/loopback lab targets need no scope file. Public targets must be listed in `scope.txt` (see `scope.txt.example`).
+Private/loopback lab targets run with `--lab`. Public targets must be listed in `scope.txt` (see `scope.txt.example`); `--lab` never waives that requirement.
+
+## Remote URL assessment (`assess-url.sh`)
+
+Full workflow for an authorized target URL — safe HTTP collection, derived
+fingerprint/edge evidence, precondition-chain verdict, optional RCE evidence
+validation, and a structured report:
+
+```bash
+bash scripts/assess-url.sh https://authorized-target.example \
+  --scope-file scope.txt --asset web-01 --out url-audit-web-01
+```
+
+```text
+Usage: assess-url.sh [--url] URL [options]
+  --out DIR            output directory (default: url-audit-<timestamp>)
+  --asset NAME         asset name (default: target host)
+  --scope-file FILE    authorized host list for public targets
+  --lab                permit non-global lab addresses (loopback/private/…)
+  --exposure VALUE     internet | partner | internal | local | unknown
+  --connect-timeout S  per-request connect timeout (default 5)
+  --timeout S          per-request total time (default 15)
+  --max-redirects N    redirects followed, each re-authorized (default 5)
+  --max-bytes N        response body cap (default 1048576)
+  --rce-evidence FILE  optional RCE artifact for scripts/rce-validate.sh
+  --markers FILE       optional marker file for RCE validation
+  --verify DIR         re-verify a previous run's integrity (exit 5 on tamper)
+  --json               print assessment.json to stdout
+
+Exit codes: 0 report generated · 2 invalid/unauthorized/unsafe (no request sent)
+· 3 collection did not complete (unreachable/timeout/refused redirect/oversize)
+· 4 internal error · 5 tampering detected (--verify only)
+```
+
+Safety model (safe by default):
+
+- HTTP/HTTPS only; embedded `user:pass@` credentials refused; malformed URLs refused.
+- Every resolved address must be globally routable unless `--lab` is given; loopback,
+  private, link-local, unique-local, multicast, reserved, and cloud-metadata
+  (169.254.169.254, fd00:ec2::254) addresses all require explicit `--lab`.
+- Public targets must appear in the `--scope-file`; `--lab` alone never authorizes a public host.
+- DNS is resolved once by `scripts/url_guard.py` and pinned per request with
+  `curl --resolve`, so the connection cannot silently change destination (DNS rebinding).
+- Redirect targets are re-authorized with the same rules before being followed;
+  an https→http downgrade is refused and never followed.
+- TLS certificate verification is never disabled. No credentials, cookies, session
+  tokens, proxies from the environment, or exploit payloads are sent.
+- Response size, connect time, request time, and redirect count are all bounded.
+
+Artifacts (inside `--out DIR`):
+
+| Artifact | Content |
+|---|---|
+| `assessment.json` | machine-readable evidence artifact (schema 1, kind `url-assessment`): target/scope, safety flags, per-request records, version evidence, chain verdict, RCE state, limitations, not-tested list, next steps, SHA-256 hashes |
+| `report.md` | human-readable report: scope & authorization, safety model, outcome, request table, chain verdict with preconditions, RCE assessment, provenance hashes, what was tested / not tested, next steps, limitations |
+| `findings.jsonl` / `findings.csv` | normalized record rendered by `scripts/report.py` |
+| `fingerprint.json` / `edge.json` | derived from the pinned captures; same decision rules as `fingerprint.sh` / `edge-conformance.sh` |
+| `chain.json` | precondition-chain verdict from `scripts/chain.sh` |
+| `rce.json` | only with `--rce-evidence`: validated RCE state |
+| `raw/` | raw per-request evidence: guard decisions, headers, body, curl stderr, `hops.tsv` |
+
+What a URL-only assessment **cannot** claim:
+
+- Remote assessment is deliberately separate from the Docker lab reproduction
+  (`scripts/lab-repro.sh`). Neither produces `RCE-CONFIRMED` by itself.
+- HTTP headers are hints; a version number here is never proof. Confirm with one
+  authenticated `php -v` / `php -i` from the web SAPI before closing.
+- This run sends no execution trigger: the report records `RCE not established`
+  unless a separate, authorized evidence artifact is supplied via `--rce-evidence`
+  (validated by the unchanged `scripts/rce-validate.sh`).
+- Integrity: `assess-url.sh --verify <dir>` re-checks every hashed artifact and the
+  report's consistency flags, and exits 5 on tampering or contradiction.
 
 ## Scripts
 
@@ -54,7 +127,8 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 |---|---|
 | `scripts/triage.sh` | Fast P0/P1/P2/P3/PATCHED decision from version + SAPI + key ini |
 | `scripts/fingerprint.sh` | Passive HTTP classifier for targets without SSH |
-| `scripts/assess-url.sh` | One URL in, one exposure decision out (fingerprint + one edge probe) |
+| `scripts/assess-url.sh` | Full URL-based assessment: safe collection + derived evidence + chain verdict + report (`assess-url.sh --verify DIR` re-checks integrity) |
+| `scripts/url_guard.py` | Pre-flight URL authorization: strict parsing, scope/locality checks, pinned address (no contact with the target) |
 | `scripts/inventory.sh` | Version, SAPI, ini, FPM/Apache overrides, app `ini_set`, containers |
 | `scripts/verify-hardening.sh` | Checks interim directives on the running SAPI |
 | `scripts/edge-conformance.sh` | One bounded long-key request; pass if 4xx |
@@ -63,7 +137,7 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 | `scripts/rce-validate.sh` | Four-state validator for externally produced RCE evidence (CONFIRMED / NOT-REPRODUCED / INCONCLUSIVE / BLOCKED) |
 | `scripts/lab-repro.sh` | Real Docker Apache/mod_php request-parsing OOM differential; writes `repro-evidence.json` |
 | `scripts/lab-integration.sh` | Docker-gated integration test: independent reproduction → `run-audit.sh` → report assertions |
-| `scripts/lab-verify.sh` | Offline self-tests for every script (no PHP, no Docker, no internet) |
+| `scripts/lab-verify.sh` | Offline self-tests for every script + URL workflow (98 assertions; no PHP, no Docker, no internet) |
 | `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags, Repro and RCE columns |
 
 ## RCE states
@@ -102,16 +176,23 @@ report shows the observed state and not `RCE-CONFIRMED`.
 
 ## Requirements
 
-- `bash`, `curl`, `python3` (for JSON/report output)
+- `bash`, `curl`, `python3` (the URL workflow also uses `curl` + `python3`; no PHP binary is ever executed locally)
 - Optional: `ssh` for fleet mode, `docker` for image inventory
 - Docker + `php:8.4.26-apache` / `php:8.4.27-apache` only for the real lab reproduction and integration test
 - PHP is **not** required locally; the scripts read it from the target or a captured `php -i`
+- Authorization before use: a `--scope-file` listing public targets, or `--lab` for non-global lab addresses
 
 ## What it does not do
 
 It verifies exposure, configuration, edge filtering, and patch state. It does not
 generate or send a code-execution payload, and it does not implement the
 heap-grooming/exploitation chain.
+
+The URL-based workflow (`assess-url.sh`) never sends an execution trigger and
+never confirms RCE from HTTP observations alone: headers are hints, redirects to
+prohibited destinations are refused, and requests are count-, size-, and
+time-bounded. A URL assessment is separate from the Docker lab reproduction; the
+two never merge into one claim.
 
 The separate lab reproduction sends a bounded multipart body and records an OOM
 or crash differential. That is **not** exploitation and never sets
@@ -140,6 +221,8 @@ php2shell-audit/
 │   ├── triage.sh
 │   ├── fingerprint.sh
 │   ├── assess-url.sh
+│   ├── url_guard.py
+│   ├── url-report.py
 │   ├── inventory.sh
 │   ├── verify-hardening.sh
 │   ├── edge-conformance.sh

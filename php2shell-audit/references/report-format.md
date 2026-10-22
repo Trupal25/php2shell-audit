@@ -78,6 +78,42 @@ not imply execution. `report.py` flags reproduction states without evidence and
 a differential that is marked patched. `RCE-CONFIRMED` still requires the
 separate `rce-validation` artifact.
 
+### URL assessment artifact (`assessment.json`)
+
+Written by `scripts/assess-url.sh` for a remote, URL-only assessment (schema
+`1`, kind `url-assessment`). Top-level fields:
+
+- `tool` — name, version, script; `target` — url, origin, host/port, asset,
+  `scope` (mode `scope-file` | `lab`, authorized entry, scope file path),
+  exposure class.
+- `safety` — `lab_mode`, `tls_verify: "on"`, `credentials_sent/cookies_sent/
+  payload_sent: "none"`, `pinned_dns: true`, redirect policy, and the
+  max-redirects / max-bytes / timeout bounds.
+- `timestamps` — ISO-8601 UTC `started_at`/`finished_at`; `state` —
+  `ok` | `unreachable` | `collection-failed` | `aborted-unsafe-redirect` |
+  `aborted-redirect-limit` | `aborted-oversized-response`; `state_reason` —
+  a truthful reason string.
+- `collection` — one record per request: hop label, method, URL, pinned IP,
+  `curl_exit`, status, time, bytes, `oversized`; plus redirects followed,
+  edge result, baseline/final status.
+- `version_evidence` — `definitive` is **always false**; `source` is
+  `http-header-hint` or `none`; note explains that only an authenticated
+  `php -v` establishes a version.
+- `chain` — compact chain verdict (decision, version, gate, SAPI, proof,
+  preconditions); `fingerprint` — compact passive-fingerprint summary.
+- `rce` — `state` (empty when URL-only; validator states otherwise), honest
+  `note`, `validator_artifact`, allowed states.
+- `limits[]`, `limitations[]`, `not_tested[]`, `next_steps[]` — always
+  present; `consistency` — `{ok, reasons[]}` contradiction list.
+- `artifact_hashes.sha256` — every raw and derived artifact;
+  `generated_sha256` — `report.md`/`findings.csv` added by `url-report.py`.
+  `assess-url.sh --verify DIR` recomputes all hashes and re-checks
+  `consistency`; exit 5 on tampering or contradiction.
+
+The matching `findings.jsonl` record keeps `rce_state: ""` for URL-only runs
+(no exception, unless a validator artifact was passed) and `repro_state: ""`
+with `repro_summary` noting that no Docker reproduction was part of the run.
+
 ## 2. Markdown report template
 
 ```markdown

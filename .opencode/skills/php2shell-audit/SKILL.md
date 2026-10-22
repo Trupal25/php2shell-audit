@@ -33,20 +33,23 @@ One command, local host, a few seconds:
 bash scripts/triage.sh --local
 ```
 
-No shell access? Give it a URL:
+No shell access? Give it a URL (public targets need `scope.txt`; loopback/private lab targets use `--lab` instead):
 
 ```bash
-bash scripts/assess-url.sh --url https://target/ --scope-file scope.txt
+bash scripts/assess-url.sh https://target/ --scope-file scope.txt --asset web-01 --out url-audit-web-01
+# local lab alternative:
+bash scripts/assess-url.sh http://127.0.0.1:8080/ --lab
 ```
 
-It does a passive fingerprint, then one bounded long-key POST, and returns one of:
+`assess-url.sh` runs the full safe workflow: SSRF-guarded authorization (HTTP/HTTPS only, pinned DNS, re-authorized redirects, TLS verify on), a bounded redirect-validated GET, one bounded long-key POST, then the same derived evidence + `chain.sh` verdict + `report.py` output as the local pipeline. It writes `assessment.json`, `report.md`, `findings.jsonl`, `findings.csv` plus raw captures, and prints the verdict:
 
-- `P0-EXPOSED` / `P1-EXPOSED` — header hint below the gate; edge forwarded the key.
-- `P0-EDGE-MITIGATED` / `P1-EDGE-MITIGATED` — header hint below the gate; edge rejected the key. Still patch.
-- `LIKELY-PATCHED` — header hint meets the gate; confirm with one authenticated `php -v`.
-- `P0-UNVERIFIED` / `P1-UNVERIFIED` — edge probe inconclusive.
+- `CHAIN-OPEN` — header hint below the gate; edge forwarded the key (P0 for mod_php/FrankenPHP, else P1).
+- `CHAIN-BLOCKED` — a decisive control is in force (edge rejected the key) or the hint meets the gate. Still confirm with `php -v`.
+- `CHAIN-PARTIAL` / `UNKNOWN` — evidence inconclusive; do not conclude from absent headers.
 
-Headers are hints, not proof. For headers only (no POST), use `bash scripts/fingerprint.sh --url ...`.
+Exit codes: `0` report generated · `2` invalid or unauthorized/unsafe target (nothing sent) · `3` collection did not complete (unreachable/timeout/refused redirect/oversize) with a truthful failure report · `4` internal error · `5` (`--verify`) tampering or contradiction detected.
+
+Boundaries: this is remote assessment only — it sends no execution trigger, headers are hints (never a version proof), and `assess-url.sh --verify <dir>` re-checks artifact hashes and consistency. For headers only (no POST), use `bash scripts/fingerprint.sh --url ...`.
 
 For a local or SSH-reachable host, `triage.sh` prints one decision — **P0 / P1 / P2 / P3 / PATCHED** — with the reason and the next action. It checks only the high-yield facts: web SAPI, exact version against the gate, `session.upload_progress.enabled`, `memory_limit`, `max_memory_limit`, and whether mod_php/FrankenPHP is present.
 
@@ -229,6 +232,40 @@ Detailed rules and caveats are in `references/detection-and-edge.md`.
    ```
 6. Re-run Phase 1 across the whole estate: forgotten subdomains, legacy vhosts, CI runners, cron PHP binaries, queue workers, serverless layers, and sidecar containers.
 7. Remove temporary WAF rules only after every instance is patched; keep the cheap large-key/body-size rules.
+
+## Phase 5b — Remote URL assessment (no SSH)
+
+For hosts you cannot shell into, `scripts/assess-url.sh` produces the same kind of
+evidence-backed decision over HTTP, safely by default:
+
+```bash
+bash scripts/assess-url.sh https://t.example/ --scope-file scope.txt \
+  --asset web-01 --out url-audit-web-01 --exposure internet
+# loopback/private lab target:
+bash scripts/assess-url.sh http://127.0.0.1:8080/ --lab --out url-audit-lab
+```
+
+- **Authorization before anything:** `scripts/url_guard.py` parses strictly
+  (http/https only, no embedded credentials), checks every resolved address
+  against global-routability (loopback/private/link-local/metadata need
+  `--lab`), enforces the scope file for public hosts, and returns one pinned
+  address that every request (`curl --resolve`) reuses — rebinding-proof.
+- **Bounded collection:** manual redirect loop with per-hop re-authorization
+  (https→http downgrades refused), `--max-bytes`, `--connect-timeout`,
+  `--timeout`, `--max-redirects`; TLS verification is never disabled; no
+  credentials, cookies, or environment proxies are sent.
+- **Evidence normalization:** the pinned captures are normalized into
+  `fingerprint.json` / `edge.json` with the same decision rules as the local
+  scripts, then `chain.sh` issues the verdict and `report.py` renders
+  `findings.csv`; `url-report.py` writes the full `report.md`.
+- **Honest reporting:** version evidence is labeled a hint (never definitive),
+  `RCE not established` unless a validator artifact was passed with
+  `--rce-evidence`, limitations/`not_tested`/`next_steps` sections are always
+  present, and `assess-url.sh --verify <dir>` detects artifact tampering
+  (exit 5).
+- Exit codes: `0` report generated · `2` unauthorized/unsafe (nothing sent) ·
+  `3` collection incomplete with a truthful failure report · `4` internal
+  error · `5` tampering detected (`--verify`).
 
 ## Phase 6 — RCE evidence validation (optional, last)
 
