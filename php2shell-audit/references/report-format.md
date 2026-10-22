@@ -40,6 +40,7 @@
   ],
   "remediation": "Rebuild image on php:8.4.27-fpm; keep interim controls; redeploy.",
   "verified_at": "2026-10-22T10:05:00Z",
+  "rce_state": "RCE-NOT-REPRODUCED",
   "notes": "Staging pool only; production pool still on 8.4.26."
 }
 ```
@@ -50,7 +51,19 @@ Field rules:
 - `exposure`: `internet` | `partner` | `internal` | `local`.
 - `priority`: `P0` | `P1` | `P2` | `P3`.
 - `patched_min`: branch gate (`8.2.35`, `8.3.36`, `8.4.27`, `8.5.12`); `null` for EOL.
+- `rce_state` (optional): `RCE-CONFIRMED` | `RCE-NOT-REPRODUCED` | `RCE-INCONCLUSIVE` | `RCE-BLOCKED`. Omit it if no RCE evidence was validated; do not infer it from a version banner.
 - `evidence`: at least one reproducible command per claim. No evidence, no finding.
+
+### RCE evidence fields
+
+A `RCE-CONFIRMED` claim must carry the validator artifact and the marker path. See
+`references/rce-validation.md` for the full schema. The report flags:
+
+- `RCE confirmed without evidence` — `rce_state` is confirmed but `evidence` is empty.
+- `RCE confirmed but marked patched` — contradictory claim; resolve before publishing.
+
+Never upgrade a suspected exposure to `RCE-CONFIRMED` because of `X-Powered-By`, a
+version string, or an edge probe.
 
 ## 2. Markdown report template
 
@@ -69,9 +82,9 @@ Field rules:
 
 ## Patch state
 
-| Asset | SAPI | Version | Gate | Status | Exposure | Priority |
-|---|---|---|---|---|---|---|
-| ... | ... | ... | ... | ... | ... | ... |
+| Asset | SAPI | Version | Gate | Status | RCE | Exposure | Priority |
+|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | ... |
 
 ## P0/P1 findings
 
@@ -130,7 +143,29 @@ Field rules:
 <Paths to JSONL, logs, screenshots, curl transcripts.>
 ```
 
-## 3. Scoring rubric alignment
+## 3. RCE evidence (optional)
+
+Only include this section when `rce-validate.sh` has produced a state:
+
+```markdown
+## RCE evidence
+
+| Asset | State | Version / gate | Nonce | Evidence |
+|---|---|---|---|---|
+| lab-web-01 | RCE-CONFIRMED | 8.4.26 / 8.4.27 | `9f2c...` | `rce.json`, `rce-marker.txt` |
+
+- Confirmation requires execution effects, a web SAPI, upload progress enabled, a
+  fresh nonce, a matching marker hash containing the nonce, and a 64-hex request digest.
+- `RCE-NOT-REPRODUCED` means a trigger was attempted and produced no execution
+  effects. Do not describe it as a vulnerability finding or as a failed audit.
+- `RCE-INCONCLUSIVE` means the evidence is missing, malformed, tampered, replayed, or
+  the version/SAPI is unknown. Collect the missing item and re-run.
+- `RCE-BLOCKED` means the version meets the gate or a decisive control is in force.
+  It is not a confirmation of exploitability.
+- The trigger/heap-grooming chain is not part of this repository. See
+  `references/rce-validation.md`.
+
+## 4. Scoring rubric alignment
 
 Use this to prioritize work and to make the report easy to grade.
 
@@ -141,6 +176,7 @@ Use this to prioritize work and to make the report easy to grade.
 | Interim control proof | 20 | Observed values from the running pool/Apache, not a copied config file; caveats stated |
 | Edge/WAF proof | 15 | One bounded request with status/timestamp; managed ruleset verified |
 | Detection/hunt | 10 | Log/WAF/worker-churn evidence; false-positive notes |
+| RCE evidence (optional) | 10 | Four-state validator output; reproducible execution effects, fresh nonce, marker integrity |
 | Report quality | 10 | Reproducible commands, evidence per claim, owner/due dates |
 
 Deductions:
@@ -151,8 +187,10 @@ Deductions:
 - `memory_limit=-1` called a complete fix.
 - A finding with no reproducible command.
 - A control that was applied but not verified after restart.
+- Claiming RCE from a version banner or an edge probe.
+- Publishing `RCE-CONFIRMED` without the validator artifact and marker.
 
-## 4. Fast aggregation
+## 5. Fast aggregation
 
 ```bash
 # JSONL → CSV for a spreadsheet

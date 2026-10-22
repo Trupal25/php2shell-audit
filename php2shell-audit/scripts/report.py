@@ -72,6 +72,11 @@ def normalize(record: dict) -> dict:
             flags.append("marked patched below gate")
         if first(record, "status") == "vulnerable" and version_tuple(version) >= version_tuple(gate):
             flags.append("marked vulnerable at/above gate")
+    rce_state = first(record, "rce_state", default="")
+    if rce_state == "RCE-CONFIRMED" and not evidence:
+        flags.append("RCE confirmed without evidence")
+    if rce_state == "RCE-CONFIRMED" and priority == "PATCHED":
+        flags.append("RCE confirmed but marked patched")
     return {
         "asset": first(record, "asset", "host", default="unknown"),
         "priority": priority,
@@ -83,6 +88,7 @@ def normalize(record: dict) -> dict:
         "owner": first(record, "owner", default=""),
         "remediation": first(record, "remediation", default=""),
         "verified_at": first(record, "verified_at", "checked_at", default=""),
+        "rce_state": rce_state,
         "evidence_count": len(evidence),
         "interim_count": len(interim) if isinstance(interim, dict) else 0,
         "edge_count": len(edge) if isinstance(edge, dict) else 0,
@@ -97,6 +103,7 @@ def sort_key(row: dict) -> tuple:
 
 def build_markdown(rows: list[dict], title: str) -> str:
     counts = Counter(row["priority"] for row in rows)
+    rce_counts = Counter(row["rce_state"] for row in rows if row["rce_state"])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"# {title}",
@@ -108,18 +115,27 @@ def build_markdown(rows: list[dict], title: str) -> str:
         f"**P2:** {counts.get('P2', 0)} · **P3:** {counts.get('P3', 0)} · "
         f"**Patched:** {counts.get('PATCHED', 0)}",
         "",
+    ]
+    if rce_counts:
+        lines.append(
+            "**RCE:** "
+            + " · ".join(f"{state}={number}" for state, number in sorted(rce_counts.items()))
+        )
+        lines.append("")
+    lines += [
         "## Findings",
         "",
-        "| Priority | Asset | SAPI | Version | Gate | Status | Exposure | Owner | Evidence | Flags |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| Priority | Asset | SAPI | Version | Gate | Status | RCE | Exposure | Owner | Evidence | Flags |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in sorted(rows, key=sort_key):
         flags = "; ".join(row["flags"])
         values = dict(row)
         values["flags"] = flags
+        values["rce"] = values.get("rce_state") or "—"
         lines.append(
             "| {priority} | {asset} | {sapi} | {version} | {gate} | {status} | "
-            "{exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
+            "{rce} | {exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
         )
     lines += ["", "## Remediation", ""]
     for row in sorted(rows, key=sort_key):
@@ -132,7 +148,7 @@ def build_markdown(rows: list[dict], title: str) -> str:
 def build_csv(rows: list[dict], path: str) -> None:
     fields = [
         "asset", "priority", "status", "sapi", "version", "gate",
-        "exposure", "owner", "remediation", "verified_at",
+        "rce_state", "exposure", "owner", "remediation", "verified_at",
         "evidence_count", "interim_count", "edge_count", "flags",
     ]
     with open(path, "w", newline="", encoding="utf-8") as fh:

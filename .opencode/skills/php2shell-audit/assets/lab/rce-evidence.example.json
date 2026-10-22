@@ -1,0 +1,19 @@
+{
+  "_comment": "Shape only. Replace every placeholder with a real value and supply the matching marker file. This template will not validate as CONFIRMED.",
+  "kind": "rce-validation",
+  "schema": 1,
+  "asset": "lab-web-01",
+  "surface": "session.upload_progress",
+  "preconditions": {
+    "php_version": "8.4.26",
+    "web_sapi": "mod_php",
+    "upload_progress_enabled": true
+  },
+  "validation": {
+    "nonce": "REPLACE_WITH_16_TO_128_HEX_CHARACTERS",
+    "triggered_at": "2026-10-22T10:00:00Z",
+    "request_sha256": "REPLACE_WITH_64_HEX_REQUEST_DIGEST",
+    "execution_effects": ["REPLACE_WITH_OBSERVED_EFFECT"],
+    "marker_sha256": "REPLACE_WITH_64_HEX_MARKER_DIGEST"
+  }
+}

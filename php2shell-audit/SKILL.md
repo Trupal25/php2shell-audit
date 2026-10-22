@@ -1,6 +1,6 @@
 ---
 name: PHP2Shell Exposure Audit
-description: Audit PHP deployments for CVE-2026-109618 and CVE-2026-109619 (PHP2Shell). Inventories SAPI and patch level, verifies startup-config hardening, checks edge filtering, hunts exploitation signals, and produces an evidence-backed remediation report. Use for PHP fleet audits, patch verification, WAF/edge review, or incident triage. Exposure assessment only; never sends exploit payloads.
+description: Audit PHP deployments for CVE-2026-109618 and CVE-2026-109619 (PHP2Shell). Inventories SAPI and patch level, verifies startup-config hardening, checks edge filtering, hunts exploitation signals, validates externally produced RCE evidence, and produces an evidence-backed remediation report. Use for PHP fleet audits, patch verification, WAF/edge review, or incident triage. Exposure assessment only; never sends exploit payloads.
 ---
 
 # PHP2Shell Exposure Audit
@@ -13,6 +13,8 @@ Answer four questions, in order:
 4. **What evidence proves the fix?**
 
 This skill is deliberately **non-exploitative**. It does not contain, generate, or send a payload that triggers the vulnerability, discloses worker memory, or executes code. The public advisories already describe the mechanism; reproducing it adds risk without adding audit value.
+
+It does include a **four-state validator for RCE evidence** produced by a separate, authorized validation module. The validator rechecks the patch gate and controls, enforces nonce freshness and marker integrity, and refuses to confirm RCE without reproducible execution effects. The heap-overflow trigger itself is not implemented; see `references/rce-validation.md` for the exact boundary.
 
 ## Operating assumptions
 
@@ -65,6 +67,14 @@ bash scripts/verify-hardening.sh --php-bin "$(command -v php)" --strict
 
 # 3. Edge conformance (staging only, one bounded request)
 bash scripts/edge-conformance.sh --url https://staging.example.test/ --scope-file scope.txt
+
+# 4. Precondition-chain verdict from every artifact you have collected
+bash scripts/chain.sh --triage triage.jsonl --hardening hardening.jsonl \
+  --fingerprint fingerprint.json --edge edge.json --asset web-01
+
+# 5. One invocation: URL -> raw artifacts -> report.md + findings.csv
+bash scripts/run-audit.sh --url https://staging.example.test/ \
+  --scope-file scope.txt --asset web-01 --out audit-web-01
 ```
 
 Fleet mode:
@@ -72,6 +82,13 @@ Fleet mode:
 ```bash
 # scope.txt: one authorized host per line (hostname or user@host)
 bash scripts/inventory.sh --hosts scope.txt --scope-file scope.txt --json > fleet.jsonl
+```
+
+Validate the tooling in a lab before the audit window:
+
+```bash
+# Offline self-tests: stub PHP binaries + local HTTP fixtures, no internet needed.
+bash scripts/lab-verify.sh
 ```
 
 ## Phase 0 — Scope and evidence
@@ -211,7 +228,46 @@ Detailed rules and caveats are in `references/detection-and-edge.md`.
 6. Re-run Phase 1 across the whole estate: forgotten subdomains, legacy vhosts, CI runners, cron PHP binaries, queue workers, serverless layers, and sidecar containers.
 7. Remove temporary WAF rules only after every instance is patched; keep the cheap large-key/body-size rules.
 
-## Phase 6 — Hunt and regression guard
+## Phase 6 — RCE evidence validation (optional, last)
+
+Use this only when an authorized validation module has produced an execution artifact
+for an isolated lab target. Do **not** treat a version/header finding as proof of RCE.
+
+```bash
+bash scripts/rce-validate.sh \
+  --evidence rce-evidence.json \
+  --markers rce-marker.txt \
+  --asset web-01 \
+  --seen-file .rce-nonces.json
+```
+
+Four states, four different report claims:
+
+| State | Claim |
+|---|---|
+| `RCE-CONFIRMED` | Execution effects recorded, below-gate web SAPI, upload progress enabled, fresh nonce, marker hash/nonce match, request digest valid. |
+| `RCE-NOT-REPRODUCED` | A trigger was attempted; no execution effects were recorded. |
+| `RCE-INCONCLUSIVE` | Evidence missing, malformed, tampered, replayed, or the version/SAPI is unknown. |
+| `RCE-BLOCKED` | Version meets the branch gate, or a decisive control is in force. |
+
+Exit codes: `0` confirmed, `1` blocked, `2` not reproduced, `3` inconclusive, `4`
+usage/input error.
+
+Rules:
+
+- Recheck the patch gate from the artifact's own `php_version`. Never trust a
+  `below_gate` claim.
+- Require a web SAPI and `session.upload_progress.enabled=true`. Either failing is
+  `RCE-BLOCKED`, not "inconclusive".
+- Require a fresh 16–128 hex nonce, a 64-hex request digest, and a marker file whose
+  SHA-256 matches and which contains the nonce. Replays are `RCE-INCONCLUSIVE`.
+- Empty `execution_effects` is `RCE-NOT-REPRODUCED`, not a failed audit.
+- The trigger and heap grooming are **not** implemented. Without an artifact from the
+  authorized module, the strongest honest result is `NOT-REPRODUCED` or `INCONCLUSIVE`.
+
+Full detail, schema, and the missing-trigger boundary: `references/rce-validation.md`.
+
+## Phase 7 — Hunt and regression guard
 
 **Hunt** (see `references/detection-and-edge.md` for queries):
 
@@ -233,7 +289,7 @@ Detailed rules and caveats are in `references/detection-and-edge.md`.
 
 Emit one JSON object per asset plus a Markdown report. Schema and template: `references/report-format.md`.
 
-Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`.
+Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`. If RCE evidence was validated, add `rce_state` and the evidence path.
 
 ## Scoring alignment (class/lab)
 
@@ -242,9 +298,10 @@ Findings score on evidence, not on exploit attempts:
 - **P0/P1** with exact version + SAPI + reachability evidence.
 - **Interim control proof** from the running web SAPI, not a config file.
 - **Edge proof**: one bounded request with status and timestamp.
+- **RCE proof**: `RCE-CONFIRMED` only with reproducible execution evidence, fresh nonce, and a matching marker; otherwise report `NOT-REPRODUCED` / `INCONCLUSIVE` / `BLOCKED`.
 - **Remediation proof**: patched version, restart evidence, re-audit result.
 - **Coverage**: web SAPI, FPM pools, CLI, containers, CI, cron, queue.
-- Deductions: trusting `X-Powered-By`, checking only CLI, claiming WAF replaces patching, or reporting a finding without a reproducible command.
+- Deductions: trusting `X-Powered-By`, checking only CLI, claiming WAF replaces patching, reporting a finding without a reproducible command, or claiming RCE from a version banner.
 
 ## References
 
@@ -253,5 +310,7 @@ Findings score on evidence, not on exploit attempts:
 - `references/hardening.md` — php.ini/FPM/Apache/Nginx/WAF snippets and rollback.
 - `references/detection-and-edge.md` — hunt queries, WAF rules, canary design.
 - `references/report-format.md` — JSON schema, Markdown report, scoring rubric.
+- `references/rce-validation.md` — four-state evidence schema, criteria, missing-trigger boundary.
 - `assets/lab/docker-compose.yml` — disposable vulnerable/patched pair for validating the audit (no exploit endpoint).
+- `assets/lab/rce-evidence.example.json` — shape of the optional RCE evidence artifact (placeholders only).
 - `scope.txt.example` — authorized target list format.

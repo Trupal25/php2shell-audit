@@ -27,6 +27,14 @@ bash scripts/triage.sh --hosts scope.txt --scope-file scope.txt --json > fleet.j
 # Evidence + report
 bash scripts/inventory.sh --local --fast --json > inventory.jsonl
 python3 scripts/report.py --input fleet.jsonl --md report.md --csv findings.csv
+
+# One invocation: URL -> raw artifacts -> report.md + findings.csv
+bash scripts/run-audit.sh --url https://target/ --scope-file scope.txt \
+  --asset web-01 --out audit-web-01
+
+# Optional: validate externally produced RCE evidence (four states)
+bash scripts/rce-validate.sh --evidence rce-evidence.json \
+  --markers rce-marker.txt --asset lab-web-01
 ```
 
 Private/loopback lab targets need no scope file. Public targets must be listed in `scope.txt` (see `scope.txt.example`).
@@ -41,7 +49,26 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 | `scripts/inventory.sh` | Version, SAPI, ini, FPM/Apache overrides, app `ini_set`, containers |
 | `scripts/verify-hardening.sh` | Checks interim directives on the running SAPI |
 | `scripts/edge-conformance.sh` | One bounded long-key request; pass if 4xx |
-| `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags |
+| `scripts/chain.sh` | Aggregates triage/fingerprint/hardening/edge artifacts into CHAIN-OPEN/PARTIAL/BLOCKED |
+| `scripts/run-audit.sh` | One invocation: fingerprint + edge + optional host evidence + chain + optional RCE validation + report |
+| `scripts/rce-validate.sh` | Four-state validator for externally produced RCE evidence (CONFIRMED / NOT-REPRODUCED / INCONCLUSIVE / BLOCKED) |
+| `scripts/lab-verify.sh` | Offline self-tests for every script (32 assertions; no PHP, no Docker, no internet) |
+| `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags and an RCE column |
+
+## RCE states
+
+`rce-validate.sh` distinguishes what the evidence actually supports:
+
+| State | Meaning |
+|---|---|
+| `RCE-CONFIRMED` | Execution effects + below-gate web SAPI + upload progress on + fresh nonce + marker hash/nonce match + request digest. |
+| `RCE-NOT-REPRODUCED` | Trigger attempted, no execution effects recorded. |
+| `RCE-INCONCLUSIVE` | Missing, malformed, tampered, replayed, or unknown-version/SAPI evidence. |
+| `RCE-BLOCKED` | Patched version, non-web SAPI, or upload progress disabled. |
+
+Exit codes: `0` confirmed, `1` blocked, `2` not reproduced, `3` inconclusive, `4`
+usage/input error. The validator consumes an artifact; it does not generate the
+trigger. Full schema and boundary: `references/rce-validation.md`.
 
 ## Requirements
 
@@ -51,7 +78,18 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 
 ## What it does not do
 
-It verifies exposure, configuration, edge filtering, and patch state. It does not generate or send an exploit payload. Use the isolated `assets/lab/` pair for a harmless vulnerable/patched comparison.
+It verifies exposure, configuration, edge filtering, and patch state. It does not
+generate or send an exploit payload, and it does not implement the heap-overflow
+trigger or heap-grooming chain.
+
+It **does** validate an RCE evidence artifact produced by a separate, authorized
+validation module. Without such an artifact, the pipeline cannot honestly reach
+`RCE-CONFIRMED`: an attempted trigger with no effects is `RCE-NOT-REPRODUCED`, and
+missing or inconsistent evidence is `RCE-INCONCLUSIVE`. See
+`references/rce-validation.md` for the exact boundary and schema.
+
+Use the isolated `assets/lab/` pair for a harmless vulnerable/patched version
+comparison; it has no exploit endpoint.
 
 ## Layout
 
@@ -70,14 +108,20 @@ php2shell-audit/
 │   ├── inventory.sh
 │   ├── verify-hardening.sh
 │   ├── edge-conformance.sh
+│   ├── chain.sh
+│   ├── run-audit.sh
+│   ├── rce-validate.sh
+│   ├── lab-verify.sh
 │   └── report.py
 ├── references/
 │   ├── advisory.md
 │   ├── deployment-patterns.md
 │   ├── hardening.md
 │   ├── detection-and-edge.md
-│   └── report-format.md
+│   ├── report-format.md
+│   └── rce-validation.md
 └── assets/lab/
     ├── docker-compose.yml
-    └── index.php
+    ├── index.php
+    └── rce-evidence.example.json
 ```
