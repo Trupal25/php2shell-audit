@@ -18,6 +18,8 @@ It does include a **four-state validator for RCE evidence** produced by a separa
 
 A separate **lab reproduction** (`scripts/lab-repro.sh`) runs the real vulnerable/patched Apache pair and records a request-parsing OOM differential. That artifact is reported as `repro_state`, never as RCE; see `references/lab-reproduction.md`.
 
+A **controlled validation-module harness** (`scripts/module-run.sh`) can execute an authorized external module against the same disposable pair, but only to classify what was actually observed (`suspected-exposure`, `crash-oom`, `memory-safety-failure`, `memory-disclosure`, `demonstrated-code-execution`, or `inconclusive`). A module's self-reported JSON is a claim until corroborated by harness artifacts; execution requires `RCE-CONFIRMED` plus a matching target marker. See `references/module-interface.md`.
+
 ## Operating assumptions
 
 - **The lab target list is the scope.** Put the instructor-provided hosts in `scope.txt`; fleet and HTTP probe scripts use it. Private/loopback targets run without extra flags, so local labs have zero setup friction.
@@ -334,7 +336,65 @@ bash scripts/lab-integration.sh --out lab-integration-1
 
 It runs the reproduction independently, consumes the artifact through
 `run-audit.sh`, and asserts the report reflects the observed result without
-`RCE-CONFIRMED`. The offline `scripts/lab-verify.sh` remains the default test.
+`RCE-CONFIRMED`. It also executes the real `oom-differential` module twice
+(repeatability), checks isolation/limits/cleanup/provenance, and consumes the
+real module artifact through `run-audit.sh` (62 assertions). The offline
+`scripts/lab-verify.sh` remains the default test.
+
+## Phase 6c — Controlled validation modules (optional)
+
+Use this only with a module supplied by an authorized researcher and only in the
+disposable local lab. The harness is not an exploit generator; it executes and
+corroborates someone else's module.
+
+```bash
+# Contract check without Docker (must succeed before any execution)
+bash scripts/module-run.sh --module modules/oom-differential --dry-run --json
+
+# Execute and classify
+bash scripts/module-run.sh --module modules/oom-differential \
+  --asset lab-vulnerable --out module-run-oom --json
+
+# Normalize the run into an audit report
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-module --module-run module-run-oom/module-run.json
+
+# Or execute inside run-audit
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-module --module modules/oom-differential
+```
+
+Impact taxonomy: `suspected-exposure`, `crash-oom`, `memory-safety-failure`,
+`memory-disclosure`, `demonstrated-code-execution`, `inconclusive`. The
+classifier is deliberately conservative:
+
+- OOM needs corroboration from the harness Apache log and/or response artifacts;
+  a module's JSON claim alone is not enough.
+- A crash/OOM is **not** memory corruption, disclosure, or execution.
+- Disclosure needs the harness canary in a vulnerable-target dump and not in the
+  patched control.
+- Memory safety needs a sanitizer/heap-corruption signal corroborated by the
+  harness.
+- Execution needs `RCE-CONFIRMED` from `rce-validate.sh` **and** a marker that
+  the harness independently retrieved from the target with a matching hash.
+- Synthetic modules require `--allow-synthetic` and always classify
+  `inconclusive`; `run-audit.sh` ignores them as evidence.
+- If the audit target meets the patch gate, lab validation is recorded but the
+  target impact remains `inconclusive`; lab findings never make a patched target
+  look vulnerable.
+
+Isolation: internal Docker network, no published ports, module container with
+`--cap-drop ALL`, `no-new-privileges`, read-only root, tmpfs `/tmp`, 512 MB /
+1 CPU / 128 PIDs, hard timeout, no Docker socket; containers and network are
+removed on exit unless `--keep`.
+
+The bundled `modules/oom-differential` sends the upstream 150,000-header
+multipart shape. On 2026-10-22 it produced `crash-oom` (`observed`):
+`php:8.4.26-apache` OOMed under the 8 MB lab limit and `php:8.4.27-apache`
+returned the normal probe JSON. No execution, disclosure, or memory corruption
+was observed. The heap-grooming/execution trigger is not included.
+
+Full contract, trust model, and artifact schema: `references/module-interface.md`.
 
 ## Phase 7 — Hunt and regression guard
 
@@ -358,7 +418,7 @@ It runs the reproduction independently, consumes the artifact through
 
 Emit one JSON object per asset plus a Markdown report. Schema and template: `references/report-format.md`.
 
-Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`. If RCE evidence was validated, add `rce_state` and the evidence path. If lab reproduction was run, add `repro_state` and `repro_summary`; keep it separate from `rce_state`.
+Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`. If RCE evidence was validated, add `rce_state` and the evidence path. If lab reproduction was run, add `repro_state` and `repro_summary`; keep it separate from `rce_state`. If a validation module was executed or consumed, add `impact`, `impact_confidence`, `impact_applicable`, `impact_basis`, `validation_impact`, `validation_confidence`, `validation_synthetic`, `validation_summary`, `module_id`, and `module_state`. The target `impact` is not a synonym for `validation_impact`: a lab result only applies to a below-gate target, and synthetic/unverified module evidence is never promoted.
 
 ## Scoring alignment (class/lab)
 
@@ -381,6 +441,8 @@ Findings score on evidence, not on exploit attempts:
 - `references/report-format.md` — JSON schema, Markdown report, scoring rubric.
 - `references/rce-validation.md` — four-state evidence schema, criteria, missing-trigger boundary.
 - `references/lab-reproduction.md` — real request-parsing OOM differential schema, states, and non-RCE boundary.
+- `references/module-interface.md` — validation-module contract, trust model, impact taxonomy, and artifact schema.
+- `modules/oom-differential/` — real request-parsing OOM differential module; `modules/synthetic-fixture/` — synthetic trust-boundary fixture (never evidence).
 - `assets/lab/repro.ini` / `repro.php` — lab-only PHP config and harmless probe endpoint.
 - `assets/lab/docker-compose.yml` — disposable vulnerable/patched pair for validating the audit (no exploit endpoint).
 - `assets/lab/rce-evidence.example.json` — shape of the optional RCE evidence artifact (placeholders only).

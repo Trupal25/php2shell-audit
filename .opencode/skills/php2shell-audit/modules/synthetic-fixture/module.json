@@ -1,0 +1,18 @@
+{
+  "kind": "php2shell-validation-module",
+  "schema": 1,
+  "id": "synthetic-fixture",
+  "version": "1.0.0",
+  "description": "Interface/classifier fixture only. Claims code execution with fabricated artifacts and must always classify as inconclusive. Never evidence.",
+  "authorized_use": "contract tests only; never evidence; do not run against real targets",
+  "runtime": {
+    "image": "php:8.4.27-apache",
+    "entrypoint": ["php", "/module/run.php"]
+  },
+  "output": "module-result.json",
+  "claims": {
+    "synthetic": true,
+    "max_impact": "demonstrated-code-execution",
+    "surface": "synthetic interface test"
+  }
+}

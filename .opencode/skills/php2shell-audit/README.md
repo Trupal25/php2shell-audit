@@ -34,6 +34,12 @@ python3 scripts/report.py --input fleet.jsonl --md report.md --csv findings.csv
 bash scripts/lab-repro.sh --out repro-lab --json
 bash scripts/lab-integration.sh --out lab-integration-1
 
+# Controlled validation module: execute in the disposable lab, then classify impact
+bash scripts/module-run.sh --module modules/oom-differential \
+  --asset lab-vulnerable --out module-run-oom --json
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-module --module-run module-run-oom/module-run.json
+
 # One invocation: URL -> raw artifacts -> report.md + findings.csv
 bash scripts/run-audit.sh --url https://target/ --scope-file scope.txt \
   --asset web-01 --out audit-web-01
@@ -133,12 +139,14 @@ What a URL-only assessment **cannot** claim:
 | `scripts/verify-hardening.sh` | Checks interim directives on the running SAPI |
 | `scripts/edge-conformance.sh` | One bounded long-key request; pass if 4xx |
 | `scripts/chain.sh` | Aggregates triage/fingerprint/hardening/edge artifacts into CHAIN-OPEN/PARTIAL/BLOCKED |
-| `scripts/run-audit.sh` | One invocation: fingerprint + edge + optional host evidence + chain + optional reproduction/RCE evidence + report |
+| `scripts/run-audit.sh` | One invocation: fingerprint + edge + optional host evidence + chain + optional reproduction/RCE evidence + optional validation module + report |
 | `scripts/rce-validate.sh` | Four-state validator for externally produced RCE evidence (CONFIRMED / NOT-REPRODUCED / INCONCLUSIVE / BLOCKED) |
 | `scripts/lab-repro.sh` | Real Docker Apache/mod_php request-parsing OOM differential; writes `repro-evidence.json` |
-| `scripts/lab-integration.sh` | Docker-gated integration test: independent reproduction → `run-audit.sh` → report assertions |
-| `scripts/lab-verify.sh` | Offline self-tests for every script + URL workflow (98 assertions; no PHP, no Docker, no internet) |
-| `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags, Repro and RCE columns |
+| `scripts/module-run.sh` | Controlled validation-module harness: hardened internal-network lab, limits, cleanup, artifact hashes, marker retrieval, RCE bridge, impact classification |
+| `scripts/impact-classify.py` | Manifest validator + conservative impact classifier (`suspected-exposure` … `demonstrated-code-execution`, `inconclusive`) |
+| `scripts/lab-integration.sh` | Docker-gated integration test: independent reproduction + real module harness + repeatability + audit/report assertions |
+| `scripts/lab-verify.sh` | Offline self-tests for every script + URL workflow + classifier/module contract (130 assertions; no PHP, no Docker, no internet) |
+| `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags, Repro/RCE columns, and impact/validation fields |
 
 ## RCE states
 
@@ -174,11 +182,62 @@ The Docker-gated integration test (`lab-integration.sh`) runs the reproduction
 independently, then consumes its evidence through `run-audit.sh` and asserts the
 report shows the observed state and not `RCE-CONFIRMED`.
 
+## Controlled validation modules (`module-run.sh`)
+
+The harness executes an externally supplied module against a disposable,
+internal-network vulnerable/patched pair and classifies what was actually
+observed. It is the only supported way to run a module inside this project.
+
+```bash
+# Validate the contract and print the plan without Docker
+bash scripts/module-run.sh --module modules/oom-differential --dry-run --json
+
+# Execute in the lab (hardened module container, no published ports)
+bash scripts/module-run.sh --module modules/oom-differential \
+  --asset lab-vulnerable --out module-run-oom --json
+
+# Consume the run artifact in an audit
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-module --module-run module-run-oom/module-run.json
+```
+
+The module receives the prepared targets and writes a self-reported
+`module-result.json`; the harness only treats that as a **claim**. It
+independently captures Apache logs, response files, container state, and an
+optional target marker, hashes every artifact, and reclassifies. A module that
+claims execution without `RCE-CONFIRMED` plus a matching, independently
+retrieved marker remains `inconclusive`.
+
+| Impact | Meaning |
+|---|---|
+| `suspected-exposure` | Below-gate web SAPI is reachable; no dynamic experiment was completed. |
+| `crash-oom` | The vulnerable target exhausted memory or crashed, and the patched control did not; availability only. |
+| `memory-safety-failure` | A sanitizer or heap-corruption signal was observed, corroborated by harness artifacts. |
+| `memory-disclosure` | A harness canary appeared in a vulnerable-target dump and not in the patched control. |
+| `demonstrated-code-execution` | `rce-validate.sh` returned `RCE-CONFIRMED` and the harness independently retrieved a matching target marker. |
+| `inconclusive` | Missing, synthetic, unverified, contradictory, or non-differential evidence. |
+
+Isolation defaults: module image `php:8.4.27-apache`, internal Docker network,
+`--cap-drop ALL`, `no-new-privileges`, read-only root, tmpfs `/tmp`, 512 MB
+memory, 1 CPU, 128 PIDs, no published ports, no Docker socket, and a hard
+timeout. The harness removes the containers and network on exit unless
+`--keep` is set. `--allow-synthetic` is required to run the bundled fixture,
+and its result is always `inconclusive`.
+
+Demonstrated result (2026-10-22): `php:8.4.26-apache` OOMs on the bounded
+150,000-header multipart request under the lab's 8 MB limit; `php:8.4.27-apache`
+returns the normal probe JSON. The classification is `crash-oom` with
+confidence `observed`. No crash, memory disclosure, or execution was observed.
+The heap-grooming/execution trigger is not included and must come from an
+authorized external module.
+
+Full contract and trust model: `references/module-interface.md`.
+
 ## Requirements
 
 - `bash`, `curl`, `python3` (the URL workflow also uses `curl` + `python3`; no PHP binary is ever executed locally)
 - Optional: `ssh` for fleet mode, `docker` for image inventory
-- Docker + `php:8.4.26-apache` / `php:8.4.27-apache` only for the real lab reproduction and integration test
+- Docker + `php:8.4.26-apache` / `php:8.4.27-apache` only for the real lab reproduction, module harness, and integration test
 - PHP is **not** required locally; the scripts read it from the target or a captured `php -i`
 - Authorization before use: a `--scope-file` listing public targets, or `--lab` for non-global lab addresses
 
@@ -197,6 +256,13 @@ two never merge into one claim.
 The separate lab reproduction sends a bounded multipart body and records an OOM
 or crash differential. That is **not** exploitation and never sets
 `RCE-CONFIRMED`.
+
+The controlled module harness executes only modules supplied by an authorized
+researcher. It does not generate a heap-grooming or execution trigger, and it
+does not upgrade a module's self-reported JSON to a finding: claims require
+independent harness artifacts, and execution requires `RCE-CONFIRMED` plus a
+matching target marker. Synthetic fixtures are never evidence. See
+`references/module-interface.md`.
 
 It **does** validate an RCE evidence artifact produced by a separate, authorized
 validation module. Without such an artifact, the pipeline cannot honestly reach
@@ -230,9 +296,19 @@ php2shell-audit/
 │   ├── run-audit.sh
 │   ├── rce-validate.sh
 │   ├── lab-repro.sh
+│   ├── module-run.sh
+│   ├── impact-classify.py
 │   ├── lab-integration.sh
 │   ├── lab-verify.sh
 │   └── report.py
+├── modules/
+│   ├── README.md
+│   ├── oom-differential/
+│   │   ├── module.json
+│   │   └── run.php
+│   └── synthetic-fixture/
+│       ├── module.json
+│       └── run.php
 ├── references/
 │   ├── advisory.md
 │   ├── deployment-patterns.md
@@ -240,7 +316,8 @@ php2shell-audit/
 │   ├── detection-and-edge.md
 │   ├── report-format.md
 │   ├── rce-validation.md
-│   └── lab-reproduction.md
+│   ├── lab-reproduction.md
+│   └── module-interface.md
 └── assets/lab/
     ├── docker-compose.yml
     ├── index.php

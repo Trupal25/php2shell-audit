@@ -374,6 +374,111 @@ EOF
     > "$tmpdir/audit-repro-bad.log" 2>&1
   expect "run-audit rejects inconsistent repro state" "REPRO-INCONCLUSIVE" \
     "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repro_state"])' "$tmpdir/audit-repro-bad/findings.jsonl" 2>/dev/null)"
+
+  # Validation-module consumption. These are synthetic-shaped offline fixtures
+  # with real response artifacts so the classifier can verify hashes. They are
+  # not real lab results and must never be presented as exploitation evidence.
+  python3 - "$tmpdir/module-fixture" "$tmpdir/module-synthetic" <<'PY'
+import hashlib, json, os, sys
+
+real_root, synth_root = sys.argv[1:3]
+for root in (real_root, synth_root):
+    os.makedirs(os.path.join(root, "raw"), exist_ok=True)
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def artifact(root, rel, role, kind, data):
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return {"path": rel, "role": role, "kind": kind, "sha256": sha(data), "bytes": len(data)}
+
+v_oom = b"Allowed memory size of 8388608 bytes exhausted (tried to allocate 262144 bytes)\n"
+p_norm = b'{"probe":"lab-reproduction","php_version":"8.4.27"}\n'
+real_artifacts = [
+    artifact(real_root, "raw/vulnerable.response", "vulnerable", "response", v_oom),
+    artifact(real_root, "raw/patched.response", "patched", "response", p_norm),
+]
+real_result = {
+    "kind": "validation-module-result", "schema": 1,
+    "module": {"id": "oom-differential", "version": "1.0.0", "synthetic": False},
+    "status": "completed", "asset": "lab-01", "nonce": "a" * 32,
+    "claims": {"impact": "crash-oom", "execution_effects": [], "oom_observed": True,
+               "control_oom_observed": False, "normal_observed": False,
+               "control_normal_observed": True, "differential": True},
+    "requests": [], "artifacts": real_artifacts, "evidence": {},
+    "limitations": ["Offline fixture: not a real lab run."],
+}
+real_run = {
+    "kind": "validation-module-run", "schema": 1, "asset": "lab-01",
+    "module": {"id": "oom-differential", "version": "1.0.0", "sha256": "b" * 64, "synthetic": False},
+    "synthetic": False, "state": "completed", "result": real_result,
+    "classification": {"kind": "impact-classification", "schema": 1, "asset": "lab-01",
+                       "module_id": "oom-differential", "synthetic": False,
+                       "impact": "crash-oom", "confidence": "observed", "applicable": True,
+                       "basis": ["vulnerable target exhausted memory; patched control did not"],
+                       "checks": {"artifacts_verified": {"declared": 2, "verified": 2}},
+                       "negative_controls": {"patched_oom": False, "patched_normal_response": True},
+                       "corroboration": {"execution_corroborated": False, "marker_in_target": False},
+                       "reproduction_steps": ["Fixture reproduction step."],
+                       "environment_dependencies": ["offline fixture"], "evidence_refs": [],
+                       "limitations": ["Offline fixture: not a real lab run."]},
+    "harness_observations": {"vulnerable": {"oom_in_log": True}, "patched": {"oom_in_log": False}},
+    "corroboration": {"marker_in_target": False},
+}
+with open(os.path.join(real_root, "module-run.json"), "w", encoding="utf-8") as fh:
+    json.dump(real_run, fh, indent=2)
+    fh.write("\n")
+
+synth_result = {
+    "kind": "validation-module-result", "schema": 1,
+    "module": {"id": "synthetic-fixture", "version": "1.0.0", "synthetic": True},
+    "status": "completed", "asset": "lab-01", "nonce": "a" * 32,
+    "claims": {"impact": "demonstrated-code-execution", "execution_effects": ["fabricated"]},
+    "requests": [], "artifacts": [],
+    "evidence": {"marker_path_in_target": "/tmp/fabricated", "marker_sha256": sha(b"fabricated")},
+    "limitations": ["Synthetic fixture."],
+}
+synth_run = {
+    "kind": "validation-module-run", "schema": 1, "asset": "lab-01",
+    "module": {"id": "synthetic-fixture", "version": "1.0.0", "synthetic": True},
+    "synthetic": True, "state": "completed", "result": synth_result,
+    "classification": {"kind": "impact-classification", "schema": 1, "asset": "lab-01",
+                       "module_id": "synthetic-fixture", "synthetic": True,
+                       "impact": "demonstrated-code-execution", "confidence": "corroborated",
+                       "applicable": True, "basis": ["fabricated"], "checks": {},
+                       "negative_controls": {}, "corroboration": {}, "reproduction_steps": [],
+                       "environment_dependencies": [], "evidence_refs": [], "limitations": []},
+    "harness_observations": {}, "corroboration": {"marker_in_target": False},
+}
+with open(os.path.join(synth_root, "module-run.json"), "w", encoding="utf-8") as fh:
+    json.dump(synth_run, fh, indent=2)
+    fh.write("\n")
+PY
+  "$HERE/run-audit.sh" --url http://127.0.0.1:18093/ --out "$tmpdir/audit-module" \
+    --asset lab-01 --module-run "$tmpdir/module-fixture/module-run.json" \
+    > "$tmpdir/audit-module.log" 2>&1
+  expect "run-audit module exit 0" "0" "$?"
+  expect "run-audit module impact" "crash-oom" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["impact"])' "$tmpdir/audit-module/findings.jsonl" 2>/dev/null)"
+  expect "run-audit module report section" "yes" \
+    "$(grep -q '## Validation and impact' "$tmpdir/audit-module/report.md" 2>/dev/null && echo yes || echo no)"
+  expect "run-audit module report does not claim RCE" "no" \
+    "$(grep -q '| demonstrated-code-execution |' "$tmpdir/audit-module/report.md" 2>/dev/null && echo yes || echo no)"
+  expect "run-audit module impact artifact" "yes" \
+    "$([[ -s "$tmpdir/audit-module/impact.json" ]] && echo yes || echo no)"
+
+  "$HERE/run-audit.sh" --url http://127.0.0.1:18093/ --out "$tmpdir/audit-synthetic" \
+    --asset lab-01 --module-run "$tmpdir/module-synthetic/module-run.json" \
+    > "$tmpdir/audit-synthetic.log" 2>&1
+  expect "run-audit synthetic exit 0" "0" "$?"
+  expect "run-audit synthetic impact is not execution" "suspected-exposure" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["impact"])' "$tmpdir/audit-synthetic/findings.jsonl" 2>/dev/null)"
+  expect "run-audit synthetic report flags fixture" "yes" \
+    "$(grep -q 'synthetic validation module' "$tmpdir/audit-synthetic/report.md" 2>/dev/null && echo yes || echo no)"
+
   stop_server "$S3"
 fi
 
@@ -637,6 +742,206 @@ if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   expect "assess-url invalid --exposure -> exit 2" "2" "$?"
 else
   echo "skip    url workflow tests (curl or python3 missing)"
+fi
+
+# ---- validation-module contract + impact classifier --------------------------
+if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$tmpdir/classifier"
+  cat > "$tmpdir/classifier_selftest.py" <<'PY'
+import hashlib, json, os, subprocess, sys
+from pathlib import Path
+
+classifier = sys.argv[1]
+root = Path(sys.argv[2])
+root.mkdir(parents=True, exist_ok=True)
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def artifact(rel, role, kind, data):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return {"path": rel, "role": role, "kind": kind, "sha256": sha(data), "bytes": len(data)}
+
+def result(module_id="oom-differential", synthetic=False, claims=None, artifacts=None, evidence=None, status="completed"):
+    return {
+        "kind": "validation-module-result", "schema": 1,
+        "module": {"id": module_id, "version": "1.0.0", "synthetic": synthetic},
+        "status": status, "asset": "lab-01", "nonce": "a" * 32,
+        "claims": claims or {}, "artifacts": artifacts or [], "evidence": evidence or {},
+        "limitations": [],
+    }
+
+def prov(v_oom=False, p_oom=False, v_crash=False, p_crash=False, synthetic=False, marker=False, marker_sha=""):
+    return {
+        "kind": "validation-module-run-provenance", "schema": 1, "run_id": "run-1", "asset": "lab-01",
+        "nonce": "a" * 32, "synthetic": synthetic,
+        "module": {"id": "oom-differential", "version": "1.0.0", "sha256": "b" * 64},
+        "targets": {"vulnerable": {"image": "php:8.4.26-apache", "version": "8.4.26"}, "patched": {"image": "php:8.4.27-apache", "version": "8.4.27"}},
+        "harness_observations": {
+            "vulnerable": {"oom_in_log": v_oom, "crash_signal_in_log": v_crash, "running_after": True},
+            "patched": {"oom_in_log": p_oom, "crash_signal_in_log": p_crash, "running_after": True},
+        },
+        "corroboration": {"marker_in_target": marker, "marker_sha256": marker_sha},
+        "invocation": {"argv": ["bash", "scripts/module-run.sh"], "host": "lab", "docker_version": "29.9.2", "resource_limits": {"memory": "512m", "cpus": "1", "pids_limit": 128}},
+        "network": {"name": "p2s-x", "internal": True},
+        "module_container": {"exit_code": 0, "timed_out": False, "logs": "raw/module.log"},
+    }
+
+def classify(name, res, pr, extra=None, canary=None):
+    rp = root / f"{name}.result.json"
+    pp = root / f"{name}.prov.json"
+    op = root / f"{name}.classification.json"
+    rp.write_text(json.dumps(res))
+    pp.write_text(json.dumps(pr))
+    cmd = [sys.executable, classifier, "--result", str(rp), "--provenance", str(pp),
+           "--result-dir", str(root), "--out", str(op), "--json"]
+    if extra:
+        cmd.extend(extra)
+    if canary:
+        cmd.extend(["--canary", canary])
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return json.loads(cp.stdout).get("impact", "PARSE-ERROR")
+    except ValueError:
+        return "PARSE-ERROR"
+
+v_oom = b"Allowed memory size of 8388608 bytes exhausted (tried to allocate 262144 bytes)\n"
+p_norm = b'{"probe":"lab-reproduction","php_version":"8.4.27"}\n'
+mem = b"zend_mm_heap corrupted\n"
+canary = "CANARY-0123456789abcdef"
+cases = [
+    ("classifier corroborated OOM", "crash-oom", classify(
+        "oom",
+        result(claims={"impact": "crash-oom", "oom_observed": True, "control_oom_observed": False, "differential": True},
+               artifacts=[artifact("raw/vulnerable.response", "vulnerable", "response", v_oom),
+                          artifact("raw/patched.response", "patched", "response", p_norm)]),
+        prov(v_oom=True))),
+    ("classifier harness-log OOM", "crash-oom", classify(
+        "oom-log", result(claims={"impact": "crash-oom"}), prov(v_oom=True))),
+    ("classifier synthetic RCE rejected", "inconclusive", classify(
+        "synthetic-rce",
+        result(module_id="synthetic-fixture", synthetic=True,
+               claims={"impact": "demonstrated-code-execution", "execution_effects": ["fake"]},
+               evidence={"marker_path_in_target": "/tmp/x", "marker_sha256": sha(b"fake")}),
+        prov(synthetic=True, marker=True, marker_sha=sha(b"fake")))),
+    ("classifier uncorroborated OOM rejected", "inconclusive", classify(
+        "oom-uncorroborated", result(claims={"impact": "crash-oom", "oom_observed": True}), prov())),
+    ("classifier memory-safety signal", "memory-safety-failure", classify(
+        "memsafety",
+        result(claims={"impact": "memory-safety-failure"},
+               artifacts=[artifact("raw/vulnerable.response", "vulnerable", "response", mem),
+                          artifact("raw/patched.response", "patched", "response", p_norm)]),
+        prov(v_crash=True))),
+    ("classifier disclosure canary", "memory-disclosure", classify(
+        "disclosure",
+        result(claims={"impact": "memory-disclosure"},
+               artifacts=[artifact("raw/vuln.dump", "vulnerable", "memory-dump", b"x" + canary.encode() + b"y"),
+                          artifact("raw/patched.dump", "patched", "memory-dump", b"clean")]),
+        prov(), canary=canary)),
+    ("classifier disclosure without canary", "inconclusive", classify(
+        "disclosure-nocanary",
+        result(claims={"impact": "memory-disclosure"},
+               artifacts=[artifact("raw/vuln2.dump", "vulnerable", "memory-dump", b"x" + canary.encode() + b"y"),
+                          artifact("raw/patched2.dump", "patched", "memory-dump", b"clean")]),
+        prov())),
+    ("classifier both-target OOM", "inconclusive", classify(
+        "oom-both",
+        result(claims={"impact": "crash-oom", "oom_observed": True, "control_oom_observed": True, "differential": False},
+               artifacts=[artifact("raw/vuln3.response", "vulnerable", "response", v_oom),
+                          artifact("raw/patched3.response", "patched", "response", v_oom)]),
+        prov(v_oom=True, p_oom=True))),
+]
+
+marker = root / "marker.txt"
+marker.write_bytes(b"P2S-MARKER-" + b"a" * 16)
+rce = root / "rce.json"
+rce.write_text(json.dumps({"state": "RCE-CONFIRMED"}))
+cases += [
+    ("classifier validated RCE", "demonstrated-code-execution", classify(
+        "rce-validated",
+        result(claims={"impact": "demonstrated-code-execution", "execution_effects": ["marker"]}),
+        prov(marker=True, marker_sha=sha(marker.read_bytes())),
+        extra=["--rce", str(rce), "--marker", str(marker)])),
+    ("classifier RCE without target marker", "inconclusive", classify(
+        "rce-no-target-marker",
+        result(claims={"impact": "demonstrated-code-execution", "execution_effects": ["marker"]}),
+        prov(marker=False), extra=["--rce", str(rce), "--marker", str(marker)])),
+    ("classifier RCE without validator", "inconclusive", classify(
+        "rce-unvalidated",
+        result(claims={"impact": "demonstrated-code-execution", "execution_effects": ["marker"]}),
+        prov(marker=True, marker_sha=sha(marker.read_bytes())), extra=["--marker", str(marker)])),
+]
+
+for name, expected, actual in cases:
+    print(f"{name}|{expected}|{actual}")
+
+# Context-only classification.
+for name, ctx, expected in [
+    ("classifier context open", {"asset": "lab-01", "version": "8.4.26", "gate": "8.4.27", "sapi": "mod_php", "decision": "CHAIN-OPEN"}, "suspected-exposure"),
+    ("classifier context patched", {"asset": "lab-02", "version": "8.4.27", "gate": "8.4.27", "sapi": "mod_php", "decision": "CHAIN-BLOCKED"}, "inconclusive"),
+]:
+    cp_path = root / f"{name.replace(' ', '-')}.json"
+    cp_path.write_text(json.dumps(ctx))
+    out = root / f"{name.replace(' ', '-')}.classification.json"
+    cp = subprocess.run([sys.executable, classifier, "--context", str(cp_path), "--out", str(out), "--json"], capture_output=True, text=True)
+    try:
+        actual = json.loads(cp.stdout).get("impact", "PARSE-ERROR")
+    except ValueError:
+        actual = "PARSE-ERROR"
+    print(f"{name}|{expected}|{actual}")
+
+# Manifest contract cases.
+repo = Path(classifier).resolve().parent.parent
+manifest_cases = [
+    ("manifest valid oom", [str(repo / "modules" / "oom-differential")], 0),
+    ("manifest synthetic refused", [str(repo / "modules" / "synthetic-fixture")], 4),
+    ("manifest synthetic allowed", [str(repo / "modules" / "synthetic-fixture"), "--allow-synthetic"], 0),
+]
+bad = root / "manifest-bad"
+bad.mkdir(exist_ok=True)
+(bad / "module.json").write_text(json.dumps({"kind": "wrong", "schema": 1, "id": "bad", "version": "1", "runtime": {"entrypoint": ["php", "/module/run.php"]}, "claims": {"synthetic": False, "max_impact": "crash-oom"}}))
+trav = root / "manifest-traversal"
+trav.mkdir(exist_ok=True)
+(trav / "module.json").write_text(json.dumps({"kind": "php2shell-validation-module", "schema": 1, "id": "bad-trav", "version": "1", "runtime": {"entrypoint": ["php", "../escape"]}, "claims": {"synthetic": False, "max_impact": "crash-oom"}}))
+manifest_cases += [("manifest bad kind", [str(bad)], 4), ("manifest entrypoint traversal", [str(trav)], 4)]
+for name, args, expected in manifest_cases:
+    cp = subprocess.run([sys.executable, classifier, "--validate-manifest", *args, "--json"], capture_output=True, text=True)
+    print(f"{name}|{expected}|{cp.returncode}")
+PY
+  python3 "$tmpdir/classifier_selftest.py" "$HERE/impact-classify.py" "$tmpdir/classifier" \
+    > "$tmpdir/classifier-results.txt" 2> "$tmpdir/classifier-err.txt"
+  expect "classifier self-test exit 0" "0" "$?"
+  while IFS='|' read -r name expected actual; do
+    [[ -z "$name" ]] && continue
+    expect "$name" "$expected" "$actual"
+  done < "$tmpdir/classifier-results.txt"
+
+  # The dry-run must validate the contract without invoking Docker.
+  mkdir -p "$tmpdir/bin-fake-docker"
+  cat > "$tmpdir/bin-fake-docker/docker" <<'SH'
+#!/usr/bin/env bash
+[[ -n "${FAKE_DOCKER_MARKER:-}" ]] && touch "$FAKE_DOCKER_MARKER"
+exit 99
+SH
+  chmod +x "$tmpdir/bin-fake-docker/docker"
+  FAKE_DOCKER_MARKER="$tmpdir/docker-called" PATH="$tmpdir/bin-fake-docker:$PATH" \
+    bash "$HERE/module-run.sh" --module "$HERE/../modules/oom-differential" --dry-run --json \
+    --out "$tmpdir/mod-dry" > "$tmpdir/mod-dry.json" 2> "$tmpdir/mod-dry.err"
+  expect "module dry-run exit 0" "0" "$?"
+  expect "module dry-run plan id" "oom-differential" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["module"]["id"])' "$tmpdir/mod-dry.json" 2>/dev/null)"
+  expect "module dry-run did not invoke docker" "no" \
+    "$([[ -e "$tmpdir/docker-called" ]] && echo yes || echo no)"
+  bash "$HERE/module-run.sh" --module "$HERE/../modules/synthetic-fixture" --dry-run \
+    --out "$tmpdir/mod-synth-refused" >/dev/null 2>&1
+  expect "synthetic module refused without flag" "4" "$?"
+  bash "$HERE/module-run.sh" --module "$HERE/../modules/synthetic-fixture" --dry-run --allow-synthetic \
+    --json --out "$tmpdir/mod-synth-allowed" >/dev/null 2>&1
+  expect "synthetic module allowed with flag" "0" "$?"
+else
+  echo "skip    validation-module contract tests (python3 missing)"
 fi
 
 echo
