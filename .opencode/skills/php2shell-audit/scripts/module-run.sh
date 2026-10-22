@@ -34,6 +34,7 @@ ASSET=""
 V_IMAGE="php:8.4.26-apache"
 P_IMAGE="php:8.4.27-apache"
 MODULE_IMAGE=""
+EXPLOIT_DIR=""
 TIMEOUT=90
 MEMORY="512m"
 CPUS="1"
@@ -51,6 +52,7 @@ MODULE_OUTPUT="module-result.json"
 ENTRY=()
 TARGET_MOUNTS=()
 INI_PATH=""
+APACHE_CONF_PATH=""
 RESULT_PATH=""
 RCE_JSON=""
 CANARY=""
@@ -65,6 +67,7 @@ V_URL=""; P_URL=""
 V_BEFORE_LINES=0; P_BEFORE_LINES=0
 MODULE_EXIT=1; MODULE_TIMED_OUT=0
 MARKER_IN_TARGET=0; MARKER_SHA=""
+CONTROL_MARKER_IN_TARGET=0; CONTROL_MARKER_SHA=""
 CONTAINERS_REMOVED=0; NETWORK_REMOVED=0
 
 usage() {
@@ -81,6 +84,8 @@ Options:
   --vulnerable-image IMG  Default: php:8.4.26-apache
   --patched-image IMG     Default: php:8.4.27-apache
   --module-image IMG      Override the manifest runtime image
+  --exploit-dir DIR       Read-only external trigger directory for modules that
+                          declare requires.external_exploit (not bundled)
   --timeout SEC           Hard module timeout (default: 90)
   --memory SIZE           Per-container memory limit (default: 512m)
   --cpus N                Per-container CPU limit (default: 1)
@@ -146,6 +151,7 @@ while [[ $# -gt 0 ]]; do
     --vulnerable-image) V_IMAGE="${2:-}"; shift 2 ;;
     --patched-image) P_IMAGE="${2:-}"; shift 2 ;;
     --module-image) MODULE_IMAGE="${2:-}"; shift 2 ;;
+    --exploit-dir) EXPLOIT_DIR="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:-90}"; shift 2 ;;
     --memory) MEMORY="${2:-512m}"; shift 2 ;;
     --cpus) CPUS="${2:-1}"; shift 2 ;;
@@ -220,6 +226,7 @@ else:
 MODULE_ID="$(manifest_get id)"
 MODULE_VERSION="$(manifest_get version)"
 SYNTHETIC="$(manifest_get claims synthetic)"
+REQUIRES_EXTERNAL="$(manifest_get requires external_exploit)"
 MODULE_OUTPUT="$(manifest_get output)"
 [[ -n "$MODULE_OUTPUT" ]] || MODULE_OUTPUT="module-result.json"
 [[ -n "$MODULE_IMAGE" ]] || MODULE_IMAGE="$(manifest_get runtime image)"
@@ -289,6 +296,29 @@ while IFS=$'\t' read -r container_path host_rel; do
   TARGET_MOUNTS+=("$host_abs:/var/www/html/$container_path:ro")
 done <<< "$TARGET_FILES_TSV"
 
+APACHE_CONF_REL="$(manifest_get target apache_conf)"
+if [[ -n "$APACHE_CONF_REL" ]]; then
+  if [[ -f "$REPO_ROOT/$APACHE_CONF_REL" ]]; then
+    APACHE_CONF_PATH="$REPO_ROOT/$APACHE_CONF_REL"
+  else
+    APACHE_CONF_PATH="$MODULE_DIR/$APACHE_CONF_REL"
+  fi
+  [[ -f "$APACHE_CONF_PATH" ]] || { echo "target apache_conf not found: $APACHE_CONF_REL" >&2; exit 4; }
+fi
+
+if [[ -n "$EXPLOIT_DIR" ]]; then
+  [[ -d "$EXPLOIT_DIR" ]] || { echo "exploit directory not found: $EXPLOIT_DIR" >&2; exit 4; }
+  EXPLOIT_DIR="$(cd "$EXPLOIT_DIR" && pwd)"
+  [[ -f "$EXPLOIT_DIR/exploit.py" ]] || {
+    echo "exploit directory has no exploit.py: $EXPLOIT_DIR" >&2
+    exit 4
+  }
+fi
+if [[ "$REQUIRES_EXTERNAL" == "1" && -z "$EXPLOIT_DIR" && "$DRY_RUN" != "1" ]]; then
+  echo "module requires an external trigger: pass --exploit-dir DIR" >&2
+  exit 4
+fi
+
 V_VERSION="$(version_from_image "$V_IMAGE")"
 P_VERSION="$(version_from_image "$P_IMAGE")"
 V_URL="http://vulnerable/repro.php"
@@ -306,7 +336,9 @@ if [[ "$DRY_RUN" == 1 ]]; then
   P2S_PLAN_V_IMAGE="$V_IMAGE" P2S_PLAN_P_IMAGE="$P_IMAGE" \
   P2S_PLAN_V_VERSION="$V_VERSION" P2S_PLAN_P_VERSION="$P_VERSION" \
   P2S_PLAN_TIMEOUT="$TIMEOUT" P2S_PLAN_MEMORY="$MEMORY" P2S_PLAN_CPUS="$CPUS" \
-  P2S_PLAN_PIDS="$PIDS" P2S_PLAN_INI="$INI_PATH" python3 - <<'PY'
+  P2S_PLAN_PIDS="$PIDS" P2S_PLAN_INI="$INI_PATH" \
+  P2S_PLAN_APACHE_CONF="$APACHE_CONF_PATH" P2S_PLAN_REQUIRES_EXTERNAL="$REQUIRES_EXTERNAL" \
+  P2S_PLAN_EXPLOIT_DIR="$EXPLOIT_DIR" python3 - <<'PY'
 import json, os, shlex
 plan = {
     "kind": "validation-module-plan",
@@ -330,6 +362,9 @@ plan = {
     },
     "timeout_seconds": int(os.environ["P2S_PLAN_TIMEOUT"]),
     "target_ini": os.environ["P2S_PLAN_INI"],
+    "target_apache_conf": os.environ.get("P2S_PLAN_APACHE_CONF") or None,
+    "requires_external_exploit": os.environ["P2S_PLAN_REQUIRES_EXTERNAL"] == "1",
+    "exploit_dir": os.environ.get("P2S_PLAN_EXPLOIT_DIR") or None,
     "would_run": True,
 }
 with open(os.environ["P2S_PLAN_OUT"], "w", encoding="utf-8") as fh:
@@ -386,6 +421,8 @@ P_DIGESTS="$(json_array_from_docker "$P_IMAGE")"
 DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
 HOST_NAME="$(hostname 2>/dev/null || echo unknown)"
 INI_SHA="$(sha256_file "$INI_PATH")"
+APACHE_CONF_SHA=""
+[[ -n "$APACHE_CONF_PATH" ]] && APACHE_CONF_SHA="$(sha256_file "$APACHE_CONF_PATH")"
 PROBE_SHA=""
 for mount in "${TARGET_MOUNTS[@]}"; do
   if [[ "$mount" == *":/var/www/html/repro.php:ro" ]]; then
@@ -412,8 +449,12 @@ start_target() {
     --memory "$MEMORY" --memory-swap "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS"
     --security-opt no-new-privileges --restart no
     -e "P2S_CANARY=$CANARY"
+    -e "N=$NONCE"
     -v "$INI_PATH:/usr/local/etc/php/conf.d/zz-p2s.ini:ro"
   )
+  if [[ -n "$APACHE_CONF_PATH" ]]; then
+    args+=(-v "$APACHE_CONF_PATH:/etc/apache2/conf-enabled/zz-p2s.conf:ro")
+  fi
   for mount in "${TARGET_MOUNTS[@]}"; do
     args+=(-v "$mount")
   done
@@ -476,6 +517,12 @@ MODULE_ARGS=(
   -e "P2S_TIMEOUT_SECONDS=$MODULE_TIMEOUT"
   -e "P2S_MODULE_DIR=/module"
 )
+if [[ -n "$EXPLOIT_DIR" ]]; then
+  MODULE_ARGS+=(
+    -v "$EXPLOIT_DIR:/opt/php2shell-upstream:ro"
+    -e "P2S_EXPLOIT_DIR=/opt/php2shell-upstream"
+  )
+fi
 docker run "${MODULE_ARGS[@]}" "$MODULE_IMAGE" "${ENTRY[@]}" >/dev/null || {
   echo "could not start the module container" >&2
   exit 2
@@ -518,6 +565,8 @@ docker inspect "$M_NAME" > "$OUT/raw/module.inspect.json" 2>/dev/null || true
 # inside the target. The copy is independent of the module's JSON.
 MARKER_TARGET_PATH=""
 MARKER_DECLARED_SHA=""
+CONTROL_MARKER_TARGET_PATH=""
+CONTROL_MARKER_DECLARED_SHA=""
 if [[ -n "$RESULT_PATH" && -f "$RESULT_PATH" ]]; then
   IFS=$'\t' read -r MARKER_TARGET_PATH MARKER_DECLARED_SHA < <(python3 - "$RESULT_PATH" <<'PY'
 import json, sys
@@ -532,6 +581,19 @@ if path and sha:
     print(path, sha, sep="\t")
 PY
 )
+  IFS=$'\t' read -r CONTROL_MARKER_TARGET_PATH CONTROL_MARKER_DECLARED_SHA < <(python3 - "$RESULT_PATH" <<'PY'
+import json, sys
+try:
+    result = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+path = str(evidence.get("control_marker_path_in_target") or "")
+sha = str(evidence.get("control_marker_sha256") or "")
+if path and sha:
+    print(path, sha, sep="\t")
+PY
+)
 fi
 if [[ -n "$MARKER_TARGET_PATH" ]]; then
   if docker exec "$V_NAME" cat "$MARKER_TARGET_PATH" > "$OUT/raw/target-marker.bin" 2>/dev/null; then
@@ -542,6 +604,17 @@ if [[ -n "$MARKER_TARGET_PATH" ]]; then
     fi
   else
     rm -f "$OUT/raw/target-marker.bin"
+  fi
+fi
+if [[ -n "$CONTROL_MARKER_TARGET_PATH" ]]; then
+  if docker exec "$P_NAME" cat "$CONTROL_MARKER_TARGET_PATH" > "$OUT/raw/control-marker.bin" 2>/dev/null; then
+    ACTUAL_CONTROL_SHA="$(sha256_file "$OUT/raw/control-marker.bin")"
+    if [[ -n "$CONTROL_MARKER_DECLARED_SHA" && "$ACTUAL_CONTROL_SHA" == "$CONTROL_MARKER_DECLARED_SHA" ]]; then
+      CONTROL_MARKER_IN_TARGET=1
+      CONTROL_MARKER_SHA="$ACTUAL_CONTROL_SHA"
+    fi
+  else
+    rm -f "$OUT/raw/control-marker.bin"
   fi
 fi
 
@@ -592,8 +665,9 @@ export P2S_OUT="$OUT" P2S_RUN_ID="$RUN_ID" P2S_ASSET="$ASSET" P2S_NONCE="$NONCE"
   P2S_V_VERSION="$V_VERSION" P2S_P_VERSION="$P_VERSION" P2S_V_URL="$V_URL" P2S_P_URL="$P_URL" \
   P2S_V_BEFORE_LINES="$V_BEFORE_LINES" P2S_P_BEFORE_LINES="$P_BEFORE_LINES" \
   P2S_KEEP="$KEEP" P2S_CANARY_SHA="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$CANARY")" \
-  P2S_INI_SHA="$INI_SHA" P2S_PROBE_SHA="$PROBE_SHA" \
+  P2S_INI_SHA="$INI_SHA" P2S_PROBE_SHA="$PROBE_SHA" P2S_APACHE_CONF_SHA="$APACHE_CONF_SHA" \
   P2S_MARKER_IN_TARGET="$MARKER_IN_TARGET" P2S_MARKER_SHA="$MARKER_SHA" \
+  P2S_CONTROL_MARKER_IN_TARGET="$CONTROL_MARKER_IN_TARGET" P2S_CONTROL_MARKER_SHA="$CONTROL_MARKER_SHA" \
   P2S_RESULT_PATH="$RESULT_PATH" P2S_RESULT_SHA="$RESULT_SHA" \
   P2S_CONTAINERS_REMOVED="$CONTAINERS_REMOVED" \
   P2S_NETWORK_REMOVED="$NETWORK_REMOVED" P2S_ARGV="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${ORIGINAL_ARGV[@]}")"
@@ -743,9 +817,12 @@ provenance = {
     "corroboration": {
         "marker_in_target": os.environ["P2S_MARKER_IN_TARGET"] == "1",
         "marker_sha256": os.environ["P2S_MARKER_SHA"],
+        "control_marker_in_target": os.environ["P2S_CONTROL_MARKER_IN_TARGET"] == "1",
+        "control_marker_sha256": os.environ["P2S_CONTROL_MARKER_SHA"],
         "canary_sha256": os.environ["P2S_CANARY_SHA"],
     },
     "php_ini_sha256": os.environ["P2S_INI_SHA"],
+    "apache_conf_sha256": os.environ.get("P2S_APACHE_CONF_SHA", ""),
     "probe_sha256": os.environ["P2S_PROBE_SHA"],
     "result": os.path.basename(os.environ.get("P2S_RESULT_PATH", "module-result.json")),
     "result_sha256": os.environ["P2S_RESULT_SHA"],
@@ -761,6 +838,7 @@ provenance = {
     "limitations": [
         "The harness records what the disposable lab did; it does not prove exploitability beyond the classified impact.",
         "The heap-grooming/execution trigger is supplied by the module and is not included in this repository.",
+        "Modules that declare requires.external_exploit receive an operator-supplied, read-only trigger directory; that source is not vendored.",
     ],
 }
 with open(os.path.join(out, "provenance.json"), "w", encoding="utf-8") as fh:

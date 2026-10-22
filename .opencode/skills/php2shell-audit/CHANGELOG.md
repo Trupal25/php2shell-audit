@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.6.0 — 2026-10-22
+
+- `modules/rce-modphp/` (new, opt-in): real RCE validation adapter for
+  `php:8.4.26-apache` / mod_php / amd64 with the calibrated 8 MB,
+  `display_errors=On`, single-worker lab profile. The module does **not** bundle
+  an exploit: it requires an operator-supplied, authorized php2shell upstream
+  trigger mounted read-only with `--exploit-dir`. The trigger source is not
+  redistributed because the upstream repository has no explicit license.
+- The adapter instruments only the external trigger's request body/response
+  capture, runs it against the vulnerable lab and the patched control, and writes
+  an `rce-validation` artifact plus a `validation-module-result`. The target
+  receives `N=<harness nonce>`; the short 14-byte command `echo $N>/tmp/m`
+  writes a nonce-bound marker without a staged payload.
+- `scripts/module-run.sh`: added `target.apache_conf` mounting, target `N`
+  nonce binding, `--exploit-dir` read-only external-trigger mount, control-marker
+  retrieval, and `apache_conf_sha256` provenance. Modules that declare
+  `requires.external_exploit` refuse to run without `--exploit-dir`.
+- `scripts/impact-classify.py`: validates `target.apache_conf` and
+  `requires.external_exploit`; a control marker on the patched target now
+  downgrades execution to `inconclusive` (no differential).
+- `scripts/run-audit.sh`: added `--module-exploit-dir`; the report falls back to
+  the module-embedded `rce_validation` state when no standalone `rce.json` exists,
+  so a corroborated module execution is shown as `RCE-CONFIRMED` and is not
+  flagged as “execution impact without RCE-CONFIRMED”.
+- `scripts/report.py`: same fallback for older findings records that carry the
+  validation-module run but not a top-level `rce_state`.
+- `scripts/rce-integration.sh` (new, opt-in): runs the RCE module twice against
+  fresh disposable labs and asserts `demonstrated-code-execution`,
+  `RCE-CONFIRMED`, nonce-bound marker hash, absent patched control marker,
+  verified artifacts, and cleanup (34 assertions). This is separate from the
+  existing 62 Docker integration assertions.
+- `assets/lab/rce.ini` and `assets/lab/apache-single.conf` (new): calibrated lab
+  profile for the RCE module; not a production configuration.
+- `scripts/lab-verify.sh`: 130 → 140 offline assertions, adding the RCE manifest,
+  control-marker downgrade, and external-trigger dry-run/refusal checks.
+
+Verified locally on 2026-10-22 with the pinned upstream trigger (sha256
+`331789f087d79aaf60ecd71380d7e70b25adc4d8ff1bf8115e1866cfdd2aaaf8`):
+two consecutive module runs produced `demonstrated-code-execution`, a
+`RCE-CONFIRMED` validator state, and a marker containing the fresh harness nonce;
+the patched control produced no marker. The trigger remains an external
+dependency and is never used by `assess-url.sh`.
+
 ## 1.5.0 — 2026-10-22
 
 - `scripts/module-run.sh` (new): controlled execution harness for an external

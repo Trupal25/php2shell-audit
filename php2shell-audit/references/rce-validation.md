@@ -10,18 +10,25 @@ evidence artifact it accepts. It is the last stage of the audit-to-report pipeli
 - Patch-gate and SAPI rechecks from the evidence's own preconditions.
 - Control recheck for `session.upload_progress.enabled`.
 - Nonce freshness (replay ledger) and nonce-to-marker binding.
-- Marker-file SHA-256 integrity.
+- Marker-file SHA-256 integrity, including an independent patched-control marker.
 - Request digest shape, execution-effect presence, timestamp parsing.
 - Four-state decision, exit codes, human and JSON output.
-- Orchestration (`run-audit.sh`) and report/CSV integration.
+- Orchestration (`run-audit.sh`) and report/CSV integration, including the
+  module-embedded validator state.
+- An opt-in execution adapter (`modules/rce-modphp`) that runs an
+  operator-supplied external trigger inside the disposable lab, retrieves the
+  vulnerable/control markers, and writes a validator-compatible artifact.
 - Offline tests for all four states plus tamper and replay cases.
 
 **Not implemented: the heap-overflow trigger and heap-grooming/exploitation chain.**
 
-That is the missing technical dependency. The CVE's execution path requires a
-working trigger against a specific PHP build and SAPI, plus a heap layout that
-survives the target's allocator behavior. A reliable trigger is exploit code. This
+That remains the external dependency. The CVE's execution path requires a working
+trigger against a specific PHP build and SAPI, plus a heap layout that survives
+the target's allocator behavior. A reliable trigger is exploit code. This
 repository does not contain one, does not generate one, and does not send one.
+The `rce-modphp` adapter does not change that: it only executes an authorized
+trigger supplied by the operator. The upstream trigger has no explicit license and
+is not redistributed.
 
 A separate, non-RCE reproduction is available in `scripts/lab-repro.sh` and
 `references/lab-reproduction.md`. It runs the real vulnerable/patched Apache pair
@@ -31,11 +38,12 @@ effects and cannot reach `RCE-CONFIRMED`.
 
 Consequences:
 
-- The pipeline **cannot** reach `RCE-CONFIRMED` on its own. It reaches
-  `RCE-NOT-REPRODUCED` when a trigger was attempted without effects, and
+- The URL workflow (`assess-url.sh`) **cannot** reach `RCE-CONFIRMED` on its own.
+  It reaches `RCE-NOT-REPRODUCED` when a trigger was attempted without effects, and
   `RCE-INCONCLUSIVE` when the artifact is incomplete or inconsistent.
-- `RCE-CONFIRMED` requires an artifact produced by a separate, authorized
-  validation module that actually executed code on the isolated lab target.
+- `RCE-CONFIRMED` requires an artifact produced by an authorized execution that
+  actually ran code on the isolated lab target, plus the independent marker
+  retrieval performed by `module-run.sh`.
 - A version/header finding is **suspected exposure**, never proof of RCE.
 
 If the instructor supplies a trigger or a recorded execution artifact, this
@@ -125,6 +133,14 @@ nonce in plain text. The validator:
 3. Searches for the nonce bytes inside the marker.
 4. Checks the nonce ledger (`--seen-file`, default `.rce-nonces.json`) for reuse.
 
+The harness also retrieves the same marker path from the patched control, using
+`evidence.control_marker_path_in_target` and
+`evidence.control_marker_sha256`. If the patched marker exists with a matching
+hash, `impact-classify.py` records `control_marker_in_target: true` and refuses
+to promote the result: there is no differential. The four-state validator itself
+does not see the control; the differential is enforced by the classifier and the
+harness provenance.
+
 The ledger is keyed by asset:
 
 ```json
@@ -174,6 +190,25 @@ bash scripts/run-audit.sh \
   --markers rce-marker.txt
 ```
 
+Opt-in lab execution with the bundled adapter (the trigger is external):
+
+```bash
+bash scripts/module-run.sh \
+  --module modules/rce-modphp \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --asset lab-rce --out module-run-rce --timeout 180 --json
+
+bash scripts/run-audit.sh \
+  --url http://127.0.0.1:8081/ --asset lab-rce \
+  --out audit-lab-rce --module modules/rce-modphp \
+  --module-exploit-dir /authorized/path/php2shell-upstream --module-timeout 180
+```
+
+When no standalone `rce.json` exists, `run-audit.sh` uses the module's embedded
+`rce_validation` object, so a corroborated module run is rendered as
+`RCE-CONFIRMED` in the report instead of being flagged as execution without
+validator evidence.
+
 The report adds an `RCE` column and includes the RCE state in `findings.csv`.
 `report.py` flags `RCE confirmed without evidence` and `RCE confirmed but marked patched`.
 
@@ -218,7 +253,14 @@ trigger or for human review of the execution proof.
 
 `scripts/lab-integration.sh` is separate and Docker-gated. It runs the real
 `lab-repro.sh` differential, feeds the artifact to `run-audit.sh`, and asserts
-the report shows `REPRO-OOM-DIFFERENTIAL` and not `RCE-CONFIRMED`.
+the report shows `REPRO-OOM-DIFFERENTIAL` and not `RCE-CONFIRMED` (62 assertions).
+
+`scripts/rce-integration.sh` is opt-in and Docker-gated. It requires an
+operator-supplied external trigger and runs `modules/rce-modphp` twice against
+fresh disposable labs. It asserts `demonstrated-code-execution`, `RCE-CONFIRMED`,
+nonce-bound marker/hash, absent patched-control marker, verified artifacts, and
+cleanup (34 assertions). It is not part of the default suite and never targets
+an arbitrary URL.
 
 Run the offline suite; no PHP, Docker, or internet is required:
 
@@ -230,4 +272,13 @@ Run the integration suite only with Docker and both images available:
 
 ```bash
 bash scripts/lab-integration.sh --out lab-integration-1
+```
+
+Run the opt-in RCE repeatability suite only with Docker and an authorized
+external trigger:
+
+```bash
+bash scripts/rce-integration.sh \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --out rce-integration-1
 ```

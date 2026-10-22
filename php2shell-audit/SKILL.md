@@ -1,6 +1,6 @@
 ---
 name: PHP2Shell Exposure Audit
-description: Audit PHP deployments for CVE-2026-109618 and CVE-2026-109619 (PHP2Shell). Inventories SAPI and patch level, verifies startup-config hardening, checks edge filtering, hunts exploitation signals, validates externally produced RCE evidence, and produces an evidence-backed remediation report. Use for PHP fleet audits, patch verification, WAF/edge review, or incident triage. Exposure assessment only; never sends exploit payloads.
+description: Audit PHP deployments for CVE-2026-109618 and CVE-2026-109619 (PHP2Shell). Inventories SAPI and patch level, verifies startup-config hardening, checks edge filtering, hunts exploitation signals, validates externally produced RCE evidence, and produces an evidence-backed remediation report. Includes an opt-in isolated-lab RCE validation module that requires an operator-supplied authorized trigger; the URL assessment workflow remains non-exploitative. Use for PHP fleet audits, patch verification, WAF/edge review, or incident triage.
 ---
 
 # PHP2Shell Exposure Audit
@@ -12,18 +12,18 @@ Answer four questions, in order:
 3. **Which interim controls are actually in force** — not just written in a file?
 4. **What evidence proves the fix?**
 
-This skill is deliberately **non-exploitative**. It does not contain, generate, or send an exploit payload that turns the bug into code execution, discloses worker memory, or executes arbitrary code. The separate lab reproduction sends a bounded multipart body that exercises request parsing and can trigger memory exhaustion; it records the vulnerable/patched differential and never claims RCE.
+The default **URL assessment workflow is deliberately non-exploitative**. It does not contain, generate, or send an exploit payload to an arbitrary target, and it never confirms RCE from headers. The separate lab reproduction sends a bounded multipart body that exercises request parsing and can trigger memory exhaustion; it records the vulnerable/patched differential and never claims RCE.
 
-It does include a **four-state validator for RCE evidence** produced by a separate, authorized validation module. The validator rechecks the patch gate and controls, enforces nonce freshness and marker integrity, and refuses to confirm RCE without reproducible execution effects. The heap-overflow trigger itself is not implemented; see `references/rce-validation.md` for the exact boundary.
+The skill includes an **opt-in isolated-lab RCE validation module** (`modules/rce-modphp`) for the calibrated `php:8.4.26-apache` / mod_php / 8 MB profile. The module does **not** contain an exploit: it requires an operator-supplied, authorized copy of the public php2shell upstream trigger, mounted read-only with `--exploit-dir`. The trigger is not bundled or redistributed because the upstream project has no explicit license. It is never invoked by `assess-url.sh` and cannot be pointed at an arbitrary URL.
 
-A separate **lab reproduction** (`scripts/lab-repro.sh`) runs the real vulnerable/patched Apache pair and records a request-parsing OOM differential. That artifact is reported as `repro_state`, never as RCE; see `references/lab-reproduction.md`.
+It also includes a **four-state validator for RCE evidence** (`scripts/rce-validate.sh`). The validator rechecks the patch gate and controls, enforces nonce freshness and marker integrity, and refuses to confirm RCE without reproducible execution effects. A separate **lab reproduction** (`scripts/lab-repro.sh`) records a request-parsing OOM differential as `repro_state`, never as RCE; see `references/lab-reproduction.md`.
 
-A **controlled validation-module harness** (`scripts/module-run.sh`) can execute an authorized external module against the same disposable pair, but only to classify what was actually observed (`suspected-exposure`, `crash-oom`, `memory-safety-failure`, `memory-disclosure`, `demonstrated-code-execution`, or `inconclusive`). A module's self-reported JSON is a claim until corroborated by harness artifacts; execution requires `RCE-CONFIRMED` plus a matching target marker. See `references/module-interface.md`.
+A **controlled validation-module harness** (`scripts/module-run.sh`) executes authorized modules against the disposable pair and classifies what was actually observed (`suspected-exposure`, `crash-oom`, `memory-safety-failure`, `memory-disclosure`, `demonstrated-code-execution`, or `inconclusive`). A module's self-reported JSON is a claim until corroborated by harness artifacts; execution requires `RCE-CONFIRMED` plus a matching target marker and no patched-control marker. See `references/module-interface.md`.
 
 ## Operating assumptions
 
 - **The lab target list is the scope.** Put the instructor-provided hosts in `scope.txt`; fleet and HTTP probe scripts use it. Private/loopback targets run without extra flags, so local labs have zero setup friction.
-- **This is an audit package, not an exploit kit.** It verifies version, configuration, edge filtering, and patch state. It does not generate or send a code-execution payload. The bounded lab reproduction is an OOM/crash observation, not exploitation. Use the isolated `assets/lab/` pair if the lab asks for a demonstration.
+- **The URL workflow is an audit package, not an exploit kit.** It verifies version, configuration, edge filtering, and patch state. It does not generate or send a code-execution payload. The bounded lab reproduction is an OOM/crash observation, not exploitation. Use the isolated `assets/lab/` pair if the lab asks for a demonstration. The only execution path is the opt-in `rce-modphp` module, which runs an operator-supplied trigger inside the disposable lab.
 - **One bounded probe.** `edge-conformance.sh` sends a single request, never retries, and stops on 502/504. That keeps the target stable and the evidence clean.
 - **Non-destructive checks.** Remediation is emitted as a diff for the owner/instructor to apply.
 
@@ -303,8 +303,10 @@ Rules:
 - Require a fresh 16–128 hex nonce, a 64-hex request digest, and a marker file whose
   SHA-256 matches and which contains the nonce. Replays are `RCE-INCONCLUSIVE`.
 - Empty `execution_effects` is `RCE-NOT-REPRODUCED`, not a failed audit.
-- The trigger and heap grooming are **not** implemented. Without an artifact from the
-  authorized module, the strongest honest result is `NOT-REPRODUCED` or `INCONCLUSIVE`.
+- The trigger and heap grooming are **not implemented in this repository**. The
+  opt-in `rce-modphp` adapter can execute an operator-supplied trigger in the
+  disposable lab. Without such an artifact, the strongest honest result is
+  `NOT-REPRODUCED` or `INCONCLUSIVE`.
 
 Full detail, schema, and the missing-trigger boundary: `references/rce-validation.md`.
 
@@ -339,13 +341,27 @@ It runs the reproduction independently, consumes the artifact through
 `RCE-CONFIRMED`. It also executes the real `oom-differential` module twice
 (repeatability), checks isolation/limits/cleanup/provenance, and consumes the
 real module artifact through `run-audit.sh` (62 assertions). The offline
-`scripts/lab-verify.sh` remains the default test.
+`scripts/lab-verify.sh` remains the default test (140 assertions).
+
+The opt-in RCE repeatability test is separate and requires an authorized
+external trigger:
+
+```bash
+bash scripts/rce-integration.sh \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --out rce-integration-1
+```
+
+It runs `modules/rce-modphp` twice against fresh disposable labs and asserts
+`demonstrated-code-execution`, `RCE-CONFIRMED`, a nonce-bound marker, no patched
+control marker, verified artifacts, and cleanup (34 assertions).
 
 ## Phase 6c — Controlled validation modules (optional)
 
-Use this only with a module supplied by an authorized researcher and only in the
-disposable local lab. The harness is not an exploit generator; it executes and
-corroborates someone else's module.
+Use this only with a module or trigger supplied by an authorized researcher and
+only in the disposable local lab. The harness is not an exploit generator; it
+executes and corroborates external code. The bundled `rce-modphp` module is an
+adapter for an external trigger, not the trigger itself.
 
 ```bash
 # Contract check without Docker (must succeed before any execution)
@@ -362,7 +378,19 @@ bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
 # Or execute inside run-audit
 bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
   --out audit-lab-module --module modules/oom-differential
+
+# Opt-in RCE validation with an operator-supplied external trigger
+bash scripts/module-run.sh \
+  --module modules/rce-modphp \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --asset lab-rce --out module-run-rce --timeout 180 --json
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-rce \
+  --out audit-lab-rce --module modules/rce-modphp \
+  --module-exploit-dir /authorized/path/php2shell-upstream --module-timeout 180
 ```
+
+The module always starts its own calibrated disposable pair; `--url` supplies
+only the audit context and is never the exploit target.
 
 Impact taxonomy: `suspected-exposure`, `crash-oom`, `memory-safety-failure`,
 `memory-disclosure`, `demonstrated-code-execution`, `inconclusive`. The
@@ -375,8 +403,9 @@ classifier is deliberately conservative:
   patched control.
 - Memory safety needs a sanitizer/heap-corruption signal corroborated by the
   harness.
-- Execution needs `RCE-CONFIRMED` from `rce-validate.sh` **and** a marker that
-  the harness independently retrieved from the target with a matching hash.
+- Execution needs `RCE-CONFIRMED` from `rce-validate.sh`, a marker that the
+  harness independently retrieved from the vulnerable target with a matching
+  hash and nonce, and **no** matching marker on the patched control.
 - Synthetic modules require `--allow-synthetic` and always classify
   `inconclusive`; `run-audit.sh` ignores them as evidence.
 - If the audit target meets the patch gate, lab validation is recorded but the
@@ -392,9 +421,17 @@ The bundled `modules/oom-differential` sends the upstream 150,000-header
 multipart shape. On 2026-10-22 it produced `crash-oom` (`observed`):
 `php:8.4.26-apache` OOMed under the 8 MB lab limit and `php:8.4.27-apache`
 returned the normal probe JSON. No execution, disclosure, or memory corruption
-was observed. The heap-grooming/execution trigger is not included.
+was observed.
+
+The bundled `modules/rce-modphp` adapter, run with the pinned upstream trigger,
+produced `demonstrated-code-execution` and `RCE-CONFIRMED` on two consecutive
+fresh labs; the marker contained the fresh harness nonce and the patched 8.4.27
+control produced no marker. The trigger itself is not included. The adapter
+refuses a target that does not match its calibrated version/SAPI/INI/arch, and
+the harness rejects a run without `--exploit-dir`.
 
 Full contract, trust model, and artifact schema: `references/module-interface.md`.
+RCE module specifics: `modules/rce-modphp/README.md`.
 
 ## Phase 7 — Hunt and regression guard
 
@@ -442,7 +479,8 @@ Findings score on evidence, not on exploit attempts:
 - `references/rce-validation.md` — four-state evidence schema, criteria, missing-trigger boundary.
 - `references/lab-reproduction.md` — real request-parsing OOM differential schema, states, and non-RCE boundary.
 - `references/module-interface.md` — validation-module contract, trust model, impact taxonomy, and artifact schema.
-- `modules/oom-differential/` — real request-parsing OOM differential module; `modules/synthetic-fixture/` — synthetic trust-boundary fixture (never evidence).
+- `references/rce-validation.md` — four-state validator, evidence schema, marker/nonce integrity, and module bridge.
+- `modules/oom-differential/` — real request-parsing OOM differential module; `modules/rce-modphp/` — opt-in external-trigger RCE adapter; `modules/synthetic-fixture/` — synthetic trust-boundary fixture (never evidence).
 - `assets/lab/repro.ini` / `repro.php` — lab-only PHP config and harmless probe endpoint.
 - `assets/lab/docker-compose.yml` — disposable vulnerable/patched pair for validating the audit (no exploit endpoint).
 - `assets/lab/rce-evidence.example.json` — shape of the optional RCE evidence artifact (placeholders only).

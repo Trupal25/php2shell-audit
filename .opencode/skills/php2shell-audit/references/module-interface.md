@@ -11,10 +11,13 @@ The bundled modules are examples of the contract:
 | Module | Purpose | Synthetic? |
 |---|---|---|
 | `modules/oom-differential` | Bounded multipart request-parsing OOM differential (CVE-2026-109618 surface). | No |
+| `modules/rce-modphp` | Opt-in RCE adapter for the calibrated 8.4.26/mod_php lab; requires an operator-supplied external trigger. | No |
 | `modules/synthetic-fixture` | Contract and classifier test only; never evidence. | **Yes** |
 
-The heap-grooming/execution trigger is **not** included. A separately supplied,
-authorized module can implement it and plug into this interface. Without one, the
+The heap-grooming/execution trigger is **not** included. The `rce-modphp` adapter
+contains no exploit: it executes an authorized, operator-supplied upstream
+trigger mounted read-only with `--exploit-dir`. A separately supplied module can
+also implement the trigger and plug into this interface. Without a trigger, the
 framework cannot demonstrate code execution.
 
 ## 1. Trust model
@@ -25,8 +28,11 @@ framework cannot demonstrate code execution.
   network with the vulnerable and patched targets. It has no host network, no
   Docker socket, no published ports, no credentials, and cannot reach the
   internet.
-- The module receives only its own directory (read-only) and the output directory
-  (read-write). The output directory is mounted only into the module container.
+- The module receives only its own directory (read-only), its output directory
+  (read-write), and — when the manifest declares `requires.external_exploit` — a
+  read-only operator-supplied trigger directory. The output directory is mounted
+  only into the module container. The external trigger is never copied into this
+  repository.
 - Self-reported fields are **claims**. The framework independently checks request
   and artifact hashes, target logs, container state, and marker files before an
   impact is promoted. A claim with no corroboration stays `inconclusive`.
@@ -61,6 +67,7 @@ modules/oom-differential/
   },
   "target": {
     "ini": "assets/lab/repro.ini",
+    "apache_conf": "assets/lab/apache-single.conf",
     "files": {
       "repro.php": "assets/lab/repro.php",
       "index.php": "assets/lab/index.php"
@@ -86,7 +93,9 @@ Field rules:
 | `runtime.image` | Container image used to execute the module. Defaults to `php:8.4.27-apache` if omitted. |
 | `runtime.entrypoint` | Non-empty array; first token is an interpreter/binary (`php`, `python3`, `sh`, `bash`, `node`); no `..` path segments. |
 | `target.ini` | Optional PHP ini file relative to the repository root; defaults to `assets/lab/repro.ini`. |
+| `target.apache_conf` | Optional Apache config mounted read-only at `/etc/apache2/conf-enabled/zz-p2s.conf`; used for the single-worker RCE lab profile. |
 | `target.files` | Optional map of container path under `/var/www/html/` to a file relative to the module directory. Defaults to the lab reproduction files. |
+| `requires.external_exploit` | Optional boolean. When `true`, `module-run.sh` refuses an actual run without `--exploit-dir` and mounts that directory read-only at `/opt/php2shell-upstream`. |
 | `output` | Relative path; must stay inside the output directory; defaults to `module-result.json`. |
 | `claims.synthetic` | Required boolean. `true` modules are test fixtures and can never demonstrate impact. |
 | `claims.max_impact` | One of the taxonomy values in section 5. The module may not claim more than this in its result. |
@@ -115,10 +124,13 @@ The harness passes these environment variables:
 | `P2S_OUTPUT_DIR` | Writable output directory (`/out`). |
 | `P2S_TIMEOUT_SECONDS` | Module budget; stop before the harness hard timeout. |
 | `P2S_MODULE_DIR` | Read-only module directory (`/module`). |
+| `P2S_EXPLOIT_DIR` | Read-only external trigger directory (`/opt/php2shell-upstream`) when `--exploit-dir` is supplied. |
 
 The harness does **not** pass the disclosure canary to the module. The canary is
 present in the target environment and is used by the classifier to corroborate a
-claimed memory disclosure.
+claimed memory disclosure. The target containers also receive `N=<fresh harness
+nonce>` for the short marker command used by the RCE adapter; the module cannot
+read the target filesystem and must let the harness retrieve the marker.
 
 ## 4. Module result
 
@@ -195,12 +207,21 @@ A module that intends to demonstrate code execution must also produce:
    `evidence.marker_path_in_target` (absolute inside the target container) and
    `evidence.marker_sha256`.
 3. `claims.execution_effects` non-empty.
+4. For differential validation, a control marker path/hash reported as
+   `evidence.control_marker_path_in_target` / `evidence.control_marker_sha256`.
+   The harness retrieves it from the patched container as well.
 
-The harness independently retrieves the marker from the target container, hashes
-it, and records `corroboration.marker_in_target: true` only if the retrieved hash
-matches. The classifier requires a separate `RCE-CONFIRMED` validator result plus
-that corroboration. A crash, OOM, worker restart, or synthetic marker is never
-enough.
+The harness independently retrieves the marker from both target containers,
+hashes them, and records `corroboration.marker_in_target` and
+`corroboration.control_marker_in_target` only when the retrieved hashes match. The
+classifier requires a separate `RCE-CONFIRMED` validator result, a vulnerable
+marker, and no matching patched-control marker. A crash, OOM, worker restart, or
+synthetic marker is never enough.
+
+The bundled `rce-modphp` adapter uses the target environment variable
+`N=<harness nonce>` and the 14-byte command `echo $N>/tmp/m`. The harness then
+retrieves `/tmp/m` from both containers. The module cannot see the target
+filesystem; the marker and validator result are independent evidence.
 
 ### Disclosure-proof extension
 
@@ -290,7 +311,12 @@ Rules that are enforced, not advisory:
     "vulnerable": {"oom_in_log": true, "crash_signal_in_log": false, "running_after": true},
     "patched": {"oom_in_log": false, "crash_signal_in_log": false, "running_after": true}
   },
-  "corroboration": {"marker_in_target": false},
+  "corroboration": {
+    "marker_in_target": false,
+    "marker_sha256": "",
+    "control_marker_in_target": false,
+    "control_marker_sha256": ""
+  },
   "cleanup": {"kept": false, "containers_removed": true, "network_removed": true},
   "limitations": ["…"]
 }
@@ -319,6 +345,17 @@ python3 scripts/impact-classify.py \
   --run module-runs/oom-1/module-run.json \
   --out module-runs/oom-1/classification.json \
   --json
+
+# Opt-in RCE adapter with an operator-supplied external trigger.
+bash scripts/module-run.sh \
+  --module modules/rce-modphp \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --asset lab-rce --out module-runs/rce-1 --timeout 180 --json
+
+# Two-run repeatability check (34 assertions).
+bash scripts/rce-integration.sh \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --out rce-integration-1
 ```
 
 Exit codes for `module-run.sh`: `0` run and classification produced, `2`
@@ -334,6 +371,7 @@ lab pair:
 
 ```bash
 bash scripts/module-run.sh --module /authorized/path/php2shell-module \
+  --exploit-dir /authorized/path/php2shell-upstream \
   --asset lab-vulnerable --out module-runs/authorized-1 --timeout 300
 ```
 
@@ -342,7 +380,7 @@ claim success on the module's behalf. If the module produces no corroborated
 marker, the classifier will return `crash-oom`, `memory-safety-failure`,
 `memory-disclosure`, or `inconclusive` — never `demonstrated-code-execution`.
 
-## 8. Boundary
+## 8. Boundary and external trigger
 
 The following remain outside this repository and are the external dependency:
 
@@ -353,5 +391,8 @@ The following remain outside this repository and are the external dependency:
 - An execution-effect proof (marker/command output) with a fresh nonce.
 
 The interface, disposable lab, provenance, negative controls, and impact
-classification are implemented. The trigger itself is supplied by the authorized
-module, not fabricated here.
+classification are implemented. The `rce-modphp` adapter implements the
+execution-proof bridge for one calibrated profile, but the trigger itself is
+supplied by the operator and is not redistributed. The upstream trigger has no
+explicit license; review and authorization are the operator's responsibility.
+The adapter is never exposed through `assess-url.sh`.

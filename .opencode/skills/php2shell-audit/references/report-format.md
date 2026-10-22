@@ -268,14 +268,16 @@ Only include this section when `rce-validate.sh` has produced a state:
 
 - Confirmation requires execution effects, a web SAPI, upload progress enabled, a
   fresh nonce, a matching marker hash containing the nonce, and a 64-hex request digest.
+  For a module run, the patched control must not produce the same marker.
 - `RCE-NOT-REPRODUCED` means a trigger was attempted and produced no execution
   effects. Do not describe it as a vulnerability finding or as a failed audit.
 - `RCE-INCONCLUSIVE` means the evidence is missing, malformed, tampered, replayed, or
   the version/SAPI is unknown. Collect the missing item and re-run.
 - `RCE-BLOCKED` means the version meets the gate or a decisive control is in force.
   It is not a confirmation of exploitability.
-- The trigger/heap-grooming chain is not part of this repository. See
-  `references/rce-validation.md`.
+- The trigger/heap-grooming chain is not bundled. The opt-in `rce-modphp` adapter
+  executes an operator-supplied trigger inside the disposable lab; see
+  `references/rce-validation.md` and `modules/rce-modphp/README.md`.
 
 ## 5. Scoring rubric alignment
 

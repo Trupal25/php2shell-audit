@@ -1,6 +1,6 @@
 # PHP2Shell audit skill
 
-Reusable, non-destructive audit workflow for **CVE-2026-109618** and **CVE-2026-109619** (PHP2Shell).
+Reusable audit workflow for **CVE-2026-109618** and **CVE-2026-109619** (PHP2Shell), with an opt-in isolated-lab execution validation module. The URL assessment workflow remains non-exploitative.
 
 This folder is the canonical, version-controlled copy. OpenCode loads the installed copy at:
 
@@ -39,6 +39,12 @@ bash scripts/module-run.sh --module modules/oom-differential \
   --asset lab-vulnerable --out module-run-oom --json
 bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
   --out audit-lab-module --module-run module-run-oom/module-run.json
+
+# Opt-in RCE validation: requires an operator-supplied, authorized external trigger
+# (the trigger is not bundled). Runs only inside the disposable lab.
+bash scripts/rce-integration.sh \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --out rce-integration-1
 
 # One invocation: URL -> raw artifacts -> report.md + findings.csv
 bash scripts/run-audit.sh --url https://target/ --scope-file scope.txt \
@@ -118,11 +124,13 @@ Artifacts (inside `--out DIR`):
 What a URL-only assessment **cannot** claim:
 
 - Remote assessment is deliberately separate from the Docker lab reproduction
-  (`scripts/lab-repro.sh`). Neither produces `RCE-CONFIRMED` by itself.
+  (`scripts/lab-repro.sh`) and from the opt-in RCE module. The URL workflow and
+  the OOM reproduction never produce `RCE-CONFIRMED` by themselves.
 - HTTP headers are hints; a version number here is never proof. Confirm with one
   authenticated `php -v` / `php -i` from the web SAPI before closing.
 - This run sends no execution trigger: the report records `RCE not established`
   unless a separate, authorized evidence artifact is supplied via `--rce-evidence`
+  or a corroborated opt-in `--module modules/rce-modphp` lab run is recorded
   (validated by the unchanged `scripts/rce-validate.sh`).
 - Integrity: `assess-url.sh --verify <dir>` re-checks every hashed artifact and the
   report's consistency flags, and exits 5 on tampering or contradiction.
@@ -144,8 +152,9 @@ What a URL-only assessment **cannot** claim:
 | `scripts/lab-repro.sh` | Real Docker Apache/mod_php request-parsing OOM differential; writes `repro-evidence.json` |
 | `scripts/module-run.sh` | Controlled validation-module harness: hardened internal-network lab, limits, cleanup, artifact hashes, marker retrieval, RCE bridge, impact classification |
 | `scripts/impact-classify.py` | Manifest validator + conservative impact classifier (`suspected-exposure` … `demonstrated-code-execution`, `inconclusive`) |
-| `scripts/lab-integration.sh` | Docker-gated integration test: independent reproduction + real module harness + repeatability + audit/report assertions |
-| `scripts/lab-verify.sh` | Offline self-tests for every script + URL workflow + classifier/module contract (130 assertions; no PHP, no Docker, no internet) |
+| `scripts/lab-integration.sh` | Docker-gated integration test: independent reproduction + real module harness + repeatability + audit/report assertions (62 assertions) |
+| `scripts/rce-integration.sh` | Opt-in Docker-gated RCE repeatability test: two fresh labs, external trigger, marker/control/cleanup assertions (34 assertions) |
+| `scripts/lab-verify.sh` | Offline self-tests for every script + URL workflow + classifier/module contract (140 assertions; no PHP, no Docker, no internet) |
 | `scripts/report.py` | JSONL → Markdown + CSV, with evidence/priority flags, Repro/RCE columns, and impact/validation fields |
 
 ## RCE states
@@ -214,22 +223,54 @@ retrieved marker remains `inconclusive`.
 | `crash-oom` | The vulnerable target exhausted memory or crashed, and the patched control did not; availability only. |
 | `memory-safety-failure` | A sanitizer or heap-corruption signal was observed, corroborated by harness artifacts. |
 | `memory-disclosure` | A harness canary appeared in a vulnerable-target dump and not in the patched control. |
-| `demonstrated-code-execution` | `rce-validate.sh` returned `RCE-CONFIRMED` and the harness independently retrieved a matching target marker. |
+| `demonstrated-code-execution` | `rce-validate.sh` returned `RCE-CONFIRMED`; the harness independently retrieved a matching target marker and the patched control had no matching marker. |
 | `inconclusive` | Missing, synthetic, unverified, contradictory, or non-differential evidence. |
 
-Isolation defaults: module image `php:8.4.27-apache`, internal Docker network,
+Isolation defaults: the module image from its manifest (the bundled OOM module uses `php:8.4.27-apache`; the RCE adapter uses `python:3.12-slim`), internal Docker network,
 `--cap-drop ALL`, `no-new-privileges`, read-only root, tmpfs `/tmp`, 512 MB
 memory, 1 CPU, 128 PIDs, no published ports, no Docker socket, and a hard
 timeout. The harness removes the containers and network on exit unless
 `--keep` is set. `--allow-synthetic` is required to run the bundled fixture,
 and its result is always `inconclusive`.
 
-Demonstrated result (2026-10-22): `php:8.4.26-apache` OOMs on the bounded
+Demonstrated OOM result (2026-10-22): `php:8.4.26-apache` OOMs on the bounded
 150,000-header multipart request under the lab's 8 MB limit; `php:8.4.27-apache`
 returns the normal probe JSON. The classification is `crash-oom` with
-confidence `observed`. No crash, memory disclosure, or execution was observed.
-The heap-grooming/execution trigger is not included and must come from an
-authorized external module.
+confidence `observed`.
+
+### Opt-in RCE module (`modules/rce-modphp`)
+
+The bundled `rce-modphp` adapter can demonstrate code execution on the calibrated
+`php:8.4.26-apache` lab, but it does **not** contain an exploit. It requires an
+operator-supplied, authorized copy of the public php2shell upstream trigger:
+
+```bash
+bash scripts/module-run.sh \
+  --module modules/rce-modphp \
+  --exploit-dir /authorized/path/php2shell-upstream \
+  --asset lab-rce \
+  --out module-run-rce \
+  --timeout 180 --json
+```
+
+The module always starts its own disposable calibrated pair; the `--url` passed
+to `run-audit.sh` is only the audit context and is never the exploit target. The
+harness mounts the trigger read-only, starts the vulnerable and patched pair, and
+gives the targets `N=<fresh harness nonce>`. The trigger runs
+the 14-byte command `echo $N>/tmp/m`; the harness independently retrieves `/tmp/m`
+from both containers and runs `rce-validate.sh`. The result is promoted to
+`demonstrated-code-execution` only when the validator says `RCE-CONFIRMED`, the
+vulnerable marker hash matches and contains the nonce, the patched control has
+no marker, and all artifacts verify.
+
+The module is intentionally not driven by `assess-url.sh`; an arbitrary URL
+cannot invoke it. The trigger is not committed or redistributed because the
+upstream project has no explicit license. See
+[`modules/rce-modphp/README.md`](modules/rce-modphp/README.md).
+
+Verified locally on 2026-10-22 with the pinned upstream trigger: two consecutive
+fresh-lab runs produced `demonstrated-code-execution` and `RCE-CONFIRMED`; the
+patched control produced no marker.
 
 Full contract and trust model: `references/module-interface.md`.
 
@@ -237,20 +278,20 @@ Full contract and trust model: `references/module-interface.md`.
 
 - `bash`, `curl`, `python3` (the URL workflow also uses `curl` + `python3`; no PHP binary is ever executed locally)
 - Optional: `ssh` for fleet mode, `docker` for image inventory
-- Docker + `php:8.4.26-apache` / `php:8.4.27-apache` only for the real lab reproduction, module harness, and integration test
+- Docker + `php:8.4.26-apache` / `php:8.4.27-apache` for the lab reproduction, module harness, and integration tests; `python:3.12-slim` for the opt-in RCE module; an operator-supplied authorized trigger for RCE validation
 - PHP is **not** required locally; the scripts read it from the target or a captured `php -i`
 - Authorization before use: a `--scope-file` listing public targets, or `--lab` for non-global lab addresses
 
 ## What it does not do
 
-It verifies exposure, configuration, edge filtering, and patch state. It does not
-generate or send a code-execution payload, and it does not implement the
-heap-grooming/exploitation chain.
+The default URL workflow verifies exposure, configuration, edge filtering, and
+patch state. It does not generate or send a code-execution payload, and it does
+not implement the heap-grooming/exploitation chain.
 
 The URL-based workflow (`assess-url.sh`) never sends an execution trigger and
 never confirms RCE from HTTP observations alone: headers are hints, redirects to
 prohibited destinations are refused, and requests are count-, size-, and
-time-bounded. A URL assessment is separate from the Docker lab reproduction; the
+time-bounded. A URL assessment is separate from the Docker lab validation; the
 two never merge into one claim.
 
 The separate lab reproduction sends a bounded multipart body and records an OOM
@@ -261,14 +302,15 @@ The controlled module harness executes only modules supplied by an authorized
 researcher. It does not generate a heap-grooming or execution trigger, and it
 does not upgrade a module's self-reported JSON to a finding: claims require
 independent harness artifacts, and execution requires `RCE-CONFIRMED` plus a
-matching target marker. Synthetic fixtures are never evidence. See
-`references/module-interface.md`.
+matching target marker and an absent patched-control marker. Synthetic fixtures
+are never evidence. See `references/module-interface.md`.
 
-It **does** validate an RCE evidence artifact produced by a separate, authorized
-validation module. Without such an artifact, the pipeline cannot honestly reach
-`RCE-CONFIRMED`: an attempted trigger with no effects is `RCE-NOT-REPRODUCED`, and
-missing or inconsistent evidence is `RCE-INCONCLUSIVE`. See
-`references/rce-validation.md` for the exact boundary and schema.
+The opt-in `modules/rce-modphp` adapter **does** execute an operator-supplied
+external trigger inside the disposable lab, and the pipeline can therefore reach
+`RCE-CONFIRMED` when that trigger is supplied and corroborated. It never accepts
+an arbitrary URL, and the trigger is not bundled. Without a trigger, an attempted
+run with no effects is `RCE-NOT-REPRODUCED`, and missing or inconsistent evidence
+is `RCE-INCONCLUSIVE`. See `references/rce-validation.md`.
 
 Use the isolated `assets/lab/` pair for a harmless vulnerable/patched version
 comparison; it has no exploit endpoint.
@@ -298,6 +340,7 @@ php2shell-audit/
 │   ├── lab-repro.sh
 │   ├── module-run.sh
 │   ├── impact-classify.py
+│   ├── rce-integration.sh
 │   ├── lab-integration.sh
 │   ├── lab-verify.sh
 │   └── report.py
@@ -306,6 +349,12 @@ php2shell-audit/
 │   ├── oom-differential/
 │   │   ├── module.json
 │   │   └── run.php
+│   ├── rce-modphp/
+│   │   ├── module.json
+│   │   ├── run.py
+│   │   ├── rce-index.php
+│   │   ├── probe.php
+│   │   └── README.md
 │   └── synthetic-fixture/
 │       ├── module.json
 │       └── run.php
@@ -323,5 +372,7 @@ php2shell-audit/
     ├── index.php
     ├── repro.ini
     ├── repro.php
+    ├── rce.ini
+    ├── apache-single.conf
     └── rce-evidence.example.json
 ```

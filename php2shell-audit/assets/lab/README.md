@@ -35,7 +35,10 @@ Private/loopback targets need no `scope.txt`.
 
 `rce-evidence.example.json` is a shape-only template. To exercise the RCE stage, an
 authorized validation module must produce a real artifact and marker for an isolated
-target; see `../../references/rce-validation.md`. The validator will reject the
+target; see `../../references/rce-validation.md`. The opt-in RCE adapter has its own
+calibrated profile (`rce.ini`, `apache-single.conf`) and is documented in
+`../../modules/rce-modphp/README.md`; this default pair remains a harmless
+version/OOM lab and contains no exploit endpoint. The validator will reject the
 template's placeholders and will not confirm RCE without a matching marker file.
 
 ## Real request-parsing reproduction (separate from RCE)

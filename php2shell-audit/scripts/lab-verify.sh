@@ -351,6 +351,16 @@ python3 "$HERE/report.py" --input "$tmpdir/repro-noevidence.jsonl" \
 expect "report flags reproduction state without evidence" "yes" \
   "$(grep -q 'reproduction state without evidence' "$tmpdir/repro-noevidence.md" && echo yes || echo no)"
 
+# Older findings may lack the top-level rce_state but still carry the module
+# output. A patched-control marker must downgrade the displayed validator state.
+cat > "$tmpdir/control-findings.jsonl" <<'EOF'
+{"asset":"lab-control","priority":"P0","status":"vulnerable","sapi":"mod_php","version":"8.4.26","gate":"8.4.27","evidence":[{"type":"validation-module-run","output":{"rce_validation":{"state":"RCE-CONFIRMED"},"classification":{"corroboration":{"control_marker_in_target":true}}}}]}
+EOF
+python3 "$HERE/report.py" --input "$tmpdir/control-findings.jsonl" \
+  --md "$tmpdir/control-report.md" >/dev/null 2>&1
+expect "report downgrades control-marker module RCE" "yes" \
+  "$(grep -q 'RCE-INCONCLUSIVE' "$tmpdir/control-report.md" && ! grep -q '| RCE-CONFIRMED |' "$tmpdir/control-report.md" && echo yes || echo no)"
+
 # ---- end-to-end orchestration ------------------------------------------------
 if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   S3="$(run_server 18093 "PHP/8.4.26" 200)"
@@ -773,7 +783,7 @@ def result(module_id="oom-differential", synthetic=False, claims=None, artifacts
         "limitations": [],
     }
 
-def prov(v_oom=False, p_oom=False, v_crash=False, p_crash=False, synthetic=False, marker=False, marker_sha=""):
+def prov(v_oom=False, p_oom=False, v_crash=False, p_crash=False, synthetic=False, marker=False, marker_sha="", control_marker=False):
     return {
         "kind": "validation-module-run-provenance", "schema": 1, "run_id": "run-1", "asset": "lab-01",
         "nonce": "a" * 32, "synthetic": synthetic,
@@ -783,7 +793,7 @@ def prov(v_oom=False, p_oom=False, v_crash=False, p_crash=False, synthetic=False
             "vulnerable": {"oom_in_log": v_oom, "crash_signal_in_log": v_crash, "running_after": True},
             "patched": {"oom_in_log": p_oom, "crash_signal_in_log": p_crash, "running_after": True},
         },
-        "corroboration": {"marker_in_target": marker, "marker_sha256": marker_sha},
+        "corroboration": {"marker_in_target": marker, "marker_sha256": marker_sha, "control_marker_in_target": control_marker},
         "invocation": {"argv": ["bash", "scripts/module-run.sh"], "host": "lab", "docker_version": "29.9.2", "resource_limits": {"memory": "512m", "cpus": "1", "pids_limit": 128}},
         "network": {"name": "p2s-x", "internal": True},
         "module_container": {"exit_code": 0, "timed_out": False, "logs": "raw/module.log"},
@@ -872,6 +882,11 @@ cases += [
         "rce-unvalidated",
         result(claims={"impact": "demonstrated-code-execution", "execution_effects": ["marker"]}),
         prov(marker=True, marker_sha=sha(marker.read_bytes())), extra=["--marker", str(marker)])),
+    ("classifier RCE with control marker", "inconclusive", classify(
+        "rce-control-marker",
+        result(claims={"impact": "demonstrated-code-execution", "execution_effects": ["marker"]}),
+        prov(marker=True, marker_sha=sha(marker.read_bytes()), control_marker=True),
+        extra=["--rce", str(rce), "--marker", str(marker)])),
 ]
 
 for name, expected, actual in cases:
@@ -898,6 +913,7 @@ manifest_cases = [
     ("manifest valid oom", [str(repo / "modules" / "oom-differential")], 0),
     ("manifest synthetic refused", [str(repo / "modules" / "synthetic-fixture")], 4),
     ("manifest synthetic allowed", [str(repo / "modules" / "synthetic-fixture"), "--allow-synthetic"], 0),
+    ("manifest valid rce-modphp", [str(repo / "modules" / "rce-modphp")], 0),
 ]
 bad = root / "manifest-bad"
 bad.mkdir(exist_ok=True)
@@ -940,6 +956,29 @@ SH
   bash "$HERE/module-run.sh" --module "$HERE/../modules/synthetic-fixture" --dry-run --allow-synthetic \
     --json --out "$tmpdir/mod-synth-allowed" >/dev/null 2>&1
   expect "synthetic module allowed with flag" "0" "$?"
+
+  # The RCE module declares an external-trigger dependency and an Apache
+  # override. Dry-run must show both without invoking Docker or requiring the
+  # trigger to be present.
+  rm -f "$tmpdir/docker-called"
+  FAKE_DOCKER_MARKER="$tmpdir/docker-called" PATH="$tmpdir/bin-fake-docker:$PATH" \
+    bash "$HERE/module-run.sh" --module "$HERE/../modules/rce-modphp" --dry-run --json \
+    --out "$tmpdir/mod-rce-dry" > "$tmpdir/mod-rce-dry.json" 2> "$tmpdir/mod-rce-dry.err"
+  expect "rce module dry-run exit 0" "0" "$?"
+  expect "rce module dry-run id" "rce-modphp" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["module"]["id"])' "$tmpdir/mod-rce-dry.json" 2>/dev/null)"
+  expect "rce module dry-run external dependency" "True" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["requires_external_exploit"])' "$tmpdir/mod-rce-dry.json" 2>/dev/null)"
+  expect "rce module dry-run apache override" "apache-single.conf" \
+    "$(python3 -c 'import json,sys,os; print(os.path.basename(json.load(open(sys.argv[1]))["target_apache_conf"] or ""))' "$tmpdir/mod-rce-dry.json" 2>/dev/null)"
+  expect "rce module dry-run did not invoke docker" "no" \
+    "$([[ -e "$tmpdir/docker-called" ]] && echo yes || echo no)"
+  FAKE_DOCKER_MARKER="$tmpdir/docker-called" PATH="$tmpdir/bin-fake-docker:$PATH" \
+    bash "$HERE/module-run.sh" --module "$HERE/../modules/rce-modphp" \
+    --out "$tmpdir/mod-rce-no-trigger" >/dev/null 2>&1
+  expect "rce module refuses run without external trigger" "4" "$?"
+  expect "rce module refusal did not invoke docker" "no" \
+    "$([[ -e "$tmpdir/docker-called" ]] && echo yes || echo no)"
 else
   echo "skip    validation-module contract tests (python3 missing)"
 fi

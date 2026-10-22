@@ -96,6 +96,31 @@ def normalize(record: dict) -> dict:
         if first(record, "status") == "vulnerable" and version_tuple(version) >= version_tuple(gate):
             flags.append("marked vulnerable at/above gate")
     rce_state = first(record, "rce_state", default="")
+    if not rce_state:
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            output = item.get("output")
+            if not isinstance(output, dict):
+                continue
+            if item.get("type") == "rce-validation" and output.get("state"):
+                rce_state = str(output.get("state"))
+                break
+            if item.get("type") == "validation-module-run":
+                embedded = output.get("rce_validation")
+                if isinstance(embedded, dict) and embedded.get("state"):
+                    state = str(embedded.get("state"))
+                    module_cls = output.get("classification")
+                    corr = (
+                        module_cls.get("corroboration")
+                        if isinstance(module_cls, dict)
+                        and isinstance(module_cls.get("corroboration"), dict)
+                        else {}
+                    )
+                    if state == "RCE-CONFIRMED" and corr.get("control_marker_in_target"):
+                        state = "RCE-INCONCLUSIVE"
+                    rce_state = state
+                    break
     if rce_state == "RCE-CONFIRMED" and not evidence:
         flags.append("RCE confirmed without evidence")
     if rce_state == "RCE-CONFIRMED" and priority == "PATCHED":

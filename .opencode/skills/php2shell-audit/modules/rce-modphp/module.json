@@ -1,0 +1,30 @@
+{
+  "kind": "php2shell-validation-module",
+  "schema": 1,
+  "id": "rce-modphp",
+  "version": "1.0.0",
+  "description": "Opt-in session.upload_progress RCE validation for php:8.4.26-apache/mod_php amd64, using an externally supplied authorized upstream trigger.",
+  "authorized_use": "isolated local lab only; the external exploit is not bundled",
+  "runtime": {
+    "image": "python:3.12-slim",
+    "entrypoint": ["python3", "/module/run.py"]
+  },
+  "requires": {
+    "external_exploit": true,
+    "note": "Mount an authorized php2shell upstream checkout with --exploit-dir; the exploit source has no license and is not redistributed here."
+  },
+  "target": {
+    "ini": "assets/lab/rce.ini",
+    "apache_conf": "assets/lab/apache-single.conf",
+    "files": {
+      "index.php": "rce-index.php",
+      "probe.php": "probe.php"
+    }
+  },
+  "output": "module-result.json",
+  "claims": {
+    "synthetic": false,
+    "max_impact": "demonstrated-code-execution",
+    "surface": "session.upload_progress"
+  }
+}

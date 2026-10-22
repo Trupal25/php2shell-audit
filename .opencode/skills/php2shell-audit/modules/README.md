@@ -12,10 +12,15 @@ The full contract is in [`../references/module-interface.md`](../references/modu
 | Directory | Real? | What it does |
 |---|---|---|
 | `oom-differential/` | Yes | Sends the upstream 150,000-header multipart shape to 8.4.26 and 8.4.27 Apache/mod_php; records OOM differential. Maximum impact: `crash-oom`. |
+| `rce-modphp/` | Yes, opt-in | Executes an operator-supplied authorized external trigger against the calibrated 8.4.26 lab and the 8.4.27 control. Maximum impact: `demonstrated-code-execution`. The trigger is **not bundled**. |
 | `synthetic-fixture/` | **No** | Fabricates an execution claim/marker to prove the classifier rejects synthetic results. Always `inconclusive`. Requires `--allow-synthetic`. |
 
 `oom-differential` is a research probe, not an exploit. It does **not** implement
 heap grooming, memory disclosure, or code execution.
+
+`rce-modphp` is an execution adapter, not an exploit. It requires an
+operator-supplied trigger and refuses to run without `--exploit-dir`; see
+[`rce-modphp/README.md`](rce-modphp/README.md).
 
 ## Running the real module
 
@@ -88,5 +93,11 @@ execution it must:
 The harness retrieves the marker from the target independently and runs
 `scripts/rce-validate.sh`. The classifier only emits
 `demonstrated-code-execution` when the validator says `RCE-CONFIRMED`, the
-marker hash matches, the effect list is non-empty, and the module is not
-synthetic. A crash or OOM can never be promoted.
+marker hash matches, the effect list is non-empty, the patched control has no
+matching marker, and the module is not synthetic. A crash or OOM can never be
+promoted.
+
+The bundled adapter `rce-modphp` implements this pattern for the calibrated
+8.4.26 lab. It expects an external `exploit.py` and is not a substitute for
+authorization or for reviewing the trigger. Its source is not committed because
+the upstream project has no explicit license.

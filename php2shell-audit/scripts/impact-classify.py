@@ -340,6 +340,7 @@ def classify_result(
     effects = effects if isinstance(effects, list) else []
     corr = provenance.get("corroboration") if isinstance(provenance.get("corroboration"), dict) else {}
     marker_in_target = bool(corr.get("marker_in_target"))
+    control_marker_in_target = bool(corr.get("control_marker_in_target"))
     marker_sha = str(corr.get("marker_sha256") or "")
     marker_ok = False
     if marker and os.path.isfile(marker):
@@ -349,6 +350,7 @@ def classify_result(
         "rce_state": rce_state,
         "execution_effects": effects,
         "marker_in_target": marker_in_target,
+        "control_marker_in_target": control_marker_in_target,
         "marker_file_supplied": bool(marker),
         "marker_hash_matches": marker_ok,
     }
@@ -358,11 +360,16 @@ def classify_result(
         and rce_state == "RCE-CONFIRMED"
         and effects
         and marker_in_target
+        and not control_marker_in_target
         and (not marker or marker_ok)
     )
     if rce_state == "RCE-CONFIRMED" and not execution_corroborated:
         reasons.append(
             "RCE-CONFIRMED is not corroborated by a target marker and matching marker hash"
+        )
+    if control_marker_in_target:
+        reasons.append(
+            "the patched control also produced the execution marker; the effect is not differential"
         )
 
     # ---- target applicability --------------------------------------------
@@ -478,6 +485,7 @@ def classify_result(
         "patched_crash": p_crash,
         "patched_memory_safety": p_memsafety,
         "patched_disclosure_canary": p_canary,
+        "patched_execution_marker": control_marker_in_target,
         "patched_normal_response": p_normal,
         "patched_running_after": p_running,
     }
@@ -524,7 +532,7 @@ def classify_result(
         )
     if provenance.get("module_sha256"):
         env_deps.append(f"module sha256: {provenance['module_sha256']}")
-    for key in ("php_ini_sha256", "probe_sha256"):
+    for key in ("php_ini_sha256", "apache_conf_sha256", "probe_sha256"):
         if provenance.get(key):
             env_deps.append(f"{key}: {provenance[key]}")
     if not env_deps:
@@ -578,6 +586,7 @@ def classify_result(
         "negative_controls": negative_controls,
         "corroboration": {
             "marker_in_target": marker_in_target,
+            "control_marker_in_target": control_marker_in_target,
             "marker_sha256": marker_sha,
             "execution_corroborated": execution_corroborated,
             "canary_supplied": bool(canary_bytes),
@@ -645,6 +654,8 @@ def validate_manifest(directory: str, allow_synthetic: bool) -> tuple[dict, int]
     target = manifest.get("target") if isinstance(manifest.get("target"), dict) else {}
     if "ini" in target and not safe_rel_path(target.get("ini")):
         reasons.append("target.ini must be a safe relative path")
+    if "apache_conf" in target and not safe_rel_path(target.get("apache_conf")):
+        reasons.append("target.apache_conf must be a safe relative path")
     files = target.get("files")
     if files is not None:
         if not isinstance(files, dict):
@@ -655,6 +666,10 @@ def validate_manifest(directory: str, allow_synthetic: bool) -> tuple[dict, int]
                     reasons.append(f"target.files key is not safe: {key!r}")
                 if not safe_rel_path(value):
                     reasons.append(f"target.files value is not safe: {value!r}")
+
+    requires = manifest.get("requires") if isinstance(manifest.get("requires"), dict) else {}
+    if "external_exploit" in requires and not isinstance(requires.get("external_exploit"), bool):
+        reasons.append("requires.external_exploit must be a boolean when present")
 
     output = manifest.get("output", "module-result.json")
     if not safe_rel_path(output):

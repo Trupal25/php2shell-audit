@@ -9,3 +9,6 @@ scope.txt
 repro-*/
 lab-integration-*/
 url-audit-*/
+module-run-*/
+module-runs-*/
+rce-integration-*/

@@ -26,6 +26,7 @@ MARKERS=""
 MODULE=""
 MODULE_RUN=""
 MODULE_TIMEOUT=120
+MODULE_EXPLOIT_DIR=""
 EXPOSURE="unknown"
 
 usage() {
@@ -48,6 +49,9 @@ Options:
   --markers FILE        Optional marker file for RCE validation
   --module DIR          Execute a validation module in the disposable lab
                         (see references/module-interface.md)
+  --module-exploit-dir DIR
+                        Read-only external trigger directory for modules that
+                        require one (never bundled)
   --module-run FILE     Consume an existing module-run.json (or its directory)
   --module-timeout SEC  Module hard timeout (default: 120)
   -h, --help            Show this help
@@ -75,6 +79,7 @@ while [[ $# -gt 0 ]]; do
     --rce-evidence) RCE_EVIDENCE="${2:-}"; shift 2 ;;
     --markers) MARKERS="${2:-}"; shift 2 ;;
     --module) MODULE="${2:-}"; shift 2 ;;
+    --module-exploit-dir) MODULE_EXPLOIT_DIR="${2:-}"; shift 2 ;;
     --module-run) MODULE_RUN="${2:-}"; shift 2 ;;
     --module-timeout) MODULE_TIMEOUT="${2:-120}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -220,8 +225,10 @@ MODULE_RC=0
 if [[ -n "$MODULE" ]]; then
   log "module: executing $MODULE in the disposable lab"
   mkdir -p "$OUT/module-run"
-  "$HERE/module-run.sh" --module "$MODULE" --asset "$ASSET" --out "$OUT/module-run" \
-    --timeout "$MODULE_TIMEOUT" --json \
+  MODULE_RUN_ARGS=(--module "$MODULE" --asset "$ASSET" --out "$OUT/module-run" \
+    --timeout "$MODULE_TIMEOUT" --json)
+  [[ -n "$MODULE_EXPLOIT_DIR" ]] && MODULE_RUN_ARGS+=(--exploit-dir "$MODULE_EXPLOIT_DIR")
+  "$HERE/module-run.sh" "${MODULE_RUN_ARGS[@]}" \
     > "$OUT/module-run/stdout.json" 2> "$OUT/module-run/stderr.log" || MODULE_RC=$?
   if [[ -f "$OUT/module-run/module-run.json" ]]; then
     cp "$OUT/module-run/module-run.json" "$OUT/module-run.json"
@@ -310,6 +317,18 @@ fp = load("fingerprint.json") or {}
 edge = load("edge.json") or {}
 repro = load("repro.json") or {}
 rce = load("rce.json") or {}
+# A validation module can embed the RCE-validator result in module-run.json.
+# Use it when no standalone rce.json was produced, so the report does not
+# claim execution without the validator state that corroborated it.
+if not isinstance(rce, dict) or not rce.get("state"):
+    module_run_for_rce = load("module-run.json") or {}
+    embedded_rce = (
+        module_run_for_rce.get("rce_validation")
+        if isinstance(module_run_for_rce, dict)
+        else None
+    )
+    if isinstance(embedded_rce, dict) and embedded_rce.get("state"):
+        rce = embedded_rce
 inventory = load("inventory.jsonl") or None
 
 def vt(value):
@@ -403,6 +422,17 @@ module_verified = declared_arts > 0 and verified_arts == declared_arts
 corr = impact_cls.get("corroboration") if isinstance(impact_cls.get("corroboration"), dict) else {}
 if corr.get("execution_corroborated"):
     module_verified = True
+execution_checks = checks.get("execution") if isinstance(checks.get("execution"), dict) else {}
+control_marker = bool(
+    corr.get("control_marker_in_target")
+    or execution_checks.get("control_marker_in_target")
+)
+rce_control_downgraded = bool(control_marker and rce_state == "RCE-CONFIRMED")
+if rce_control_downgraded:
+    # The validator only sees the vulnerable marker. The classifier sees the
+    # independent patched-control marker; do not render a non-differential
+    # result as confirmed execution.
+    rce_state = "RCE-INCONCLUSIVE"
 
 target_meets_gate = bool(version != "unknown" and gate != "none" and vt(version) >= vt(gate))
 target_applicable = priority != "PATCHED" and not target_meets_gate
@@ -418,6 +448,10 @@ impact_rank = {
 candidates = []
 impact_basis = []
 impact_confidence = "insufficient"
+if rce_control_downgraded:
+    impact_basis.append(
+        "patched control produced the execution marker; the RCE validator state was not differential"
+    )
 if target_applicable:
     if impact_cls and not module_synthetic and module_verified:
         candidates.append(validation_impact)
