@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.0 — 2026-10-22
+
+- `lab-repro.sh`: real Docker Apache/mod_php reproduction. Sends one bounded
+  multipart request with the session upload-progress preamble and 150,000 ignored
+  part headers to `php:8.4.26-apache` and `php:8.4.27-apache`. Records HTTP
+  status, OOM/normal/crash signals, worker PIDs, response digests, Apache logs,
+  image IDs/digests, and the exact lab ini/request digests.
+  States: `REPRO-OOM-DIFFERENTIAL`, `REPRO-FATAL-BOTH`, `REPRO-NO-EFFECT`,
+  `REPRO-CRASH-OBSERVED`, `REPRO-UNAVAILABLE`, `REPRO-INCONCLUSIVE`.
+  The artifact always has empty `execution_effects` and `rce_observed: false`.
+- `lab-integration.sh`: Docker-gated integration test. Runs the reproduction
+  independently, feeds `repro-evidence.json` into `run-audit.sh`, and asserts the
+  report shows the observed reproduction state and does not show `RCE-CONFIRMED`.
+- `run-audit.sh`: `--repro-evidence FILE`; validates the artifact shape/asset,
+  writes `repro.json`, and keeps `repro_state` separate from `rce_state`.
+- `report.py`: separate `Repro` column, reproduction summary, `## Reproduction
+  evidence` section, and `repro_state`/`repro_summary` CSV fields.
+- `references/lab-reproduction.md`: evidence schema, states, commands, and the
+  explicit boundary between OOM differential and RCE.
+- Lab assets: `assets/lab/repro.ini` and `assets/lab/repro.php`.
+- Tests: `lab-verify.sh` extended to 38 offline assertions (report rendering and
+  inconsistent-state rejection); `lab-integration.sh` adds 14 Docker-gated
+  assertions against the real image pair.
+- Observed on 2026-10-22: 8.4.26 returned `Allowed memory size of 8388608 bytes
+  exhausted` for the 150k-header body; 8.4.27 returned the normal probe JSON.
+  No worker crash, memory disclosure, or code execution was observed.
+- Known limitation unchanged: the heap-grooming/execution chain is **not**
+  implemented. `RCE-CONFIRMED` still requires a separate authorized artifact.
+
 ## 1.2.0 — 2026-10-22
 
 - `rce-validate.sh`: four-state RCE evidence validator.

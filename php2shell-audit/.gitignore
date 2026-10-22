@@ -6,3 +6,5 @@ triage.jsonl
 report.md
 findings.csv
 scope.txt
+repro-*/
+lab-integration-*/

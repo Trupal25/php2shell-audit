@@ -40,6 +40,14 @@ bash scripts/chain.sh --triage triage.jsonl --hardening hardening.jsonl --edge e
 bash scripts/run-audit.sh --url https://target.example/ --scope-file scope.txt \
   --asset web-01 --out audit-web-01
 
+# Real lab reproduction: vulnerable/patched Apache OOM differential (Docker)
+bash scripts/lab-repro.sh --out repro-lab --json
+bash scripts/lab-integration.sh --out lab-integration-1
+
+# Consume the independently produced reproduction artifact
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-vulnerable --repro-evidence repro-lab/repro-evidence.json
+
 # Optional: validate externally produced RCE evidence
 bash scripts/rce-validate.sh --evidence rce-evidence.json \
   --markers rce-marker.txt --asset lab-web-01
@@ -64,6 +72,8 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 - Patch verification and regression gates.
 - RCE evidence validation (optional): four states with patch-gate/control rechecks,
   nonce replay protection, and marker integrity.
+- Real lab reproduction (optional): bounded multipart OOM differential against
+  `php:8.4.26-apache` and `php:8.4.27-apache`, reported separately as `repro_state`.
 
 ## RCE states
 
@@ -77,12 +87,32 @@ Private/loopback lab targets need no scope file. Public targets must be listed i
 Exit codes: `0` confirmed, `1` blocked, `2` not reproduced, `3` inconclusive, `4`
 usage/input error. Schema and criteria: `php2shell-audit/references/rce-validation.md`.
 
+## Lab reproduction states
+
+`lab-repro.sh` runs one bounded multipart request against the real vulnerable and
+patched Apache images. It reports a separate `repro_state`:
+
+| State | Meaning |
+|---|---|
+| `REPRO-OOM-DIFFERENTIAL` | Vulnerable build OOMs during parsing; patched build returns normally. |
+| `REPRO-FATAL-BOTH` | Both builds OOM; no differential. |
+| `REPRO-NO-EFFECT` | Neither build OOMs on the probe. |
+| `REPRO-CRASH-OBSERVED` | A worker crash signal was captured; still not RCE. |
+| `REPRO-UNAVAILABLE` | Docker/image/tool/readiness unavailable; no request sent. |
+| `REPRO-INCONCLUSIVE` | Unexpected result or invalid evidence. |
+
+`lab-integration.sh` is the Docker-gated integration test. It runs the
+reproduction independently, feeds the artifact to `run-audit.sh`, and asserts the
+report reflects the observed result without claiming RCE. Details:
+`php2shell-audit/references/lab-reproduction.md`.
+
 ## Scope
 
 It verifies exposure, configuration, edge filtering, and patch state. It does not
 generate or send an exploit payload, and it does not include the heap-overflow
-trigger or heap-grooming chain. The lab pair is for harmless vulnerable/patched
-comparison.
+trigger or heap-grooming chain. The lab reproduction observes request-parsing
+OOM/crash behavior; it does not demonstrate code execution. The lab pair is for
+harmless vulnerable/patched comparison.
 
 `RCE-CONFIRMED` is only reachable with an artifact from a separate, authorized
 validation module. Without one, the pipeline reports `RCE-NOT-REPRODUCED` or
@@ -90,4 +120,4 @@ validation module. Without one, the pipeline reports `RCE-NOT-REPRODUCED` or
 
 ## Version
 
-`1.2.0` — 2026-10-22. See `php2shell-audit/CHANGELOG.md`.
+`1.3.0` — 2026-10-22. See `php2shell-audit/CHANGELOG.md`.

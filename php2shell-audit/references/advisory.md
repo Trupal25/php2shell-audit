@@ -48,6 +48,14 @@ Ways a request can reach OOM while staying inside apparent PHP limits:
 - Nested field names multiply the generated array work.
 - Application-specific large allocations or repeated memory use can do it too.
 
+**Lab observation (2026-10-22).** With the lab `memory_limit=8M`, one multipart
+part carrying 150,000 ignored headers produced `Allowed memory size of 8388608
+bytes exhausted` on `php:8.4.26-apache`, while `php:8.4.27-apache` returned the
+normal JSON probe response. No worker crash, memory disclosure, or code
+execution was observed. This confirms a request-parsing behavior difference in
+the patched path; it is not an RCE proof. Reproduce it with
+`scripts/lab-repro.sh`; schema: `references/lab-reproduction.md`.
+
 **CVE-2026-109619 (stale global state).** PHP keeps worker-global pointers to request-owned memory (error, session, object, extension state). A fatal error can abandon an operation before its matching reset, and a nonfatal diagnostic can repopulate error state after cleanup. The request heap is freed while the global still refers to it. A later request handled by the same worker can consume the stale value before normal initialization replaces it. Exploitation needs a **producer** (an operation that publishes request-owned state globally), an **interruption** (fatal error, timeout, parse/compile/uncaught error), and a **consumer** (an operation that runs before normal initialization and acts on the stale state).
 
 Confirmed producer/consumer cases:

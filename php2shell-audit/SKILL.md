@@ -12,14 +12,16 @@ Answer four questions, in order:
 3. **Which interim controls are actually in force** — not just written in a file?
 4. **What evidence proves the fix?**
 
-This skill is deliberately **non-exploitative**. It does not contain, generate, or send a payload that triggers the vulnerability, discloses worker memory, or executes code. The public advisories already describe the mechanism; reproducing it adds risk without adding audit value.
+This skill is deliberately **non-exploitative**. It does not contain, generate, or send an exploit payload that turns the bug into code execution, discloses worker memory, or executes arbitrary code. The separate lab reproduction sends a bounded multipart body that exercises request parsing and can trigger memory exhaustion; it records the vulnerable/patched differential and never claims RCE.
 
 It does include a **four-state validator for RCE evidence** produced by a separate, authorized validation module. The validator rechecks the patch gate and controls, enforces nonce freshness and marker integrity, and refuses to confirm RCE without reproducible execution effects. The heap-overflow trigger itself is not implemented; see `references/rce-validation.md` for the exact boundary.
+
+A separate **lab reproduction** (`scripts/lab-repro.sh`) runs the real vulnerable/patched Apache pair and records a request-parsing OOM differential. That artifact is reported as `repro_state`, never as RCE; see `references/lab-reproduction.md`.
 
 ## Operating assumptions
 
 - **The lab target list is the scope.** Put the instructor-provided hosts in `scope.txt`; fleet and HTTP probe scripts use it. Private/loopback targets run without extra flags, so local labs have zero setup friction.
-- **This is an audit package, not an exploit kit.** It verifies version, configuration, edge filtering, and patch state. It does not generate or send a payload that triggers the vulnerability. Use the isolated `assets/lab/` pair if the lab asks for a demonstration.
+- **This is an audit package, not an exploit kit.** It verifies version, configuration, edge filtering, and patch state. It does not generate or send a code-execution payload. The bounded lab reproduction is an OOM/crash observation, not exploitation. Use the isolated `assets/lab/` pair if the lab asks for a demonstration.
 - **One bounded probe.** `edge-conformance.sh` sends a single request, never retries, and stops on 502/504. That keeps the target stable and the evidence clean.
 - **Non-destructive checks.** Remediation is emitted as a diff for the owner/instructor to apply.
 
@@ -267,6 +269,36 @@ Rules:
 
 Full detail, schema, and the missing-trigger boundary: `references/rce-validation.md`.
 
+## Phase 6b — Real lab reproduction (Docker, optional)
+
+The reproduction is separate from RCE validation. It sends one bounded multipart
+request to `php:8.4.26-apache` and `php:8.4.27-apache`, with the session
+upload-progress preamble and 150,000 ignored part headers. Under the lab's
+`memory_limit=8M`, the vulnerable parser exhausts memory; the patched parser keeps
+only the headers it uses and returns the normal probe JSON.
+
+```bash
+bash scripts/lab-repro.sh --out repro-lab --json
+bash scripts/run-audit.sh --url http://127.0.0.1:8081/ --asset lab-vulnerable \
+  --out audit-lab-vulnerable --repro-evidence repro-lab/repro-evidence.json
+```
+
+The artifact has `state: REPRO-OOM-DIFFERENTIAL`, empty `execution_effects`, and
+`rce_observed: false`. It proves a request-parsing behavior difference, **not**
+heap grooming or RCE. `REPRO-CRASH-OBSERVED` is also not RCE. The report shows a
+separate `Repro` column and a `## Reproduction evidence` section.
+
+Run the Docker-gated integration test only when Docker and both images are
+available:
+
+```bash
+bash scripts/lab-integration.sh --out lab-integration-1
+```
+
+It runs the reproduction independently, consumes the artifact through
+`run-audit.sh`, and asserts the report reflects the observed result without
+`RCE-CONFIRMED`. The offline `scripts/lab-verify.sh` remains the default test.
+
 ## Phase 7 — Hunt and regression guard
 
 **Hunt** (see `references/detection-and-edge.md` for queries):
@@ -289,7 +321,7 @@ Full detail, schema, and the missing-trigger boundary: `references/rce-validatio
 
 Emit one JSON object per asset plus a Markdown report. Schema and template: `references/report-format.md`.
 
-Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`. If RCE evidence was validated, add `rce_state` and the evidence path.
+Minimum fields: `asset`, `environment`, `sapi`, `php_version`, `build_date`, `patched_min`, `status`, `exposure`, `priority`, `interim_controls`, `edge_controls`, `evidence[]`, `remediation`, `owner`, `verified_at`. If RCE evidence was validated, add `rce_state` and the evidence path. If lab reproduction was run, add `repro_state` and `repro_summary`; keep it separate from `rce_state`.
 
 ## Scoring alignment (class/lab)
 
@@ -311,6 +343,8 @@ Findings score on evidence, not on exploit attempts:
 - `references/detection-and-edge.md` — hunt queries, WAF rules, canary design.
 - `references/report-format.md` — JSON schema, Markdown report, scoring rubric.
 - `references/rce-validation.md` — four-state evidence schema, criteria, missing-trigger boundary.
+- `references/lab-reproduction.md` — real request-parsing OOM differential schema, states, and non-RCE boundary.
+- `assets/lab/repro.ini` / `repro.php` — lab-only PHP config and harmless probe endpoint.
 - `assets/lab/docker-compose.yml` — disposable vulnerable/patched pair for validating the audit (no exploit endpoint).
 - `assets/lab/rce-evidence.example.json` — shape of the optional RCE evidence artifact (placeholders only).
 - `scope.txt.example` — authorized target list format.

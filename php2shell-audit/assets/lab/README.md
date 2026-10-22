@@ -7,8 +7,9 @@ The compose file runs two disposable Apache/mod_php containers:
 | `vulnerable` | `php:8.4.26-apache` | 8081 | Below the 8.4 gate |
 | `patched` | `php:8.4.27-apache` | 8082 | At the 8.4 gate |
 
-`index.php` is a harmless page. There is no exploit endpoint and no trigger in this
-folder.
+`index.php` is a harmless page. There is no exploit endpoint and no code-execution
+trigger in this folder. `repro.php` only reports what the parser retained; the
+bounded OOM probe is in `scripts/lab-repro.sh`.
 
 ## Use it to validate the audit, not to exploit
 
@@ -36,6 +37,30 @@ Private/loopback targets need no `scope.txt`.
 authorized validation module must produce a real artifact and marker for an isolated
 target; see `../../references/rce-validation.md`. The validator will reject the
 template's placeholders and will not confirm RCE without a matching marker file.
+
+## Real request-parsing reproduction (separate from RCE)
+
+`repro.ini` and `repro.php` support the bounded OOM differential run by
+`scripts/lab-repro.sh`. It sends one multipart request with the session
+upload-progress preamble and 150,000 ignored part headers to both images:
+
+```bash
+cd ../..
+bash scripts/lab-repro.sh --out repro-lab --json
+```
+
+The vulnerable image is expected to hit `Allowed memory size ... exhausted`; the
+patched image is expected to return the normal JSON probe response. This is a
+request-parsing behavior difference, **not** RCE. The artifact always has empty
+`execution_effects` and is reported through `repro_state`, never `rce_state`.
+See `references/lab-reproduction.md`.
+
+The Docker-gated integration test runs the reproduction independently and then
+feeds its artifact through `run-audit.sh`:
+
+```bash
+bash scripts/lab-integration.sh --out lab-integration-1
+```
 
 Do not point the lab at production, and do not expose the lab ports outside the
 isolated network.

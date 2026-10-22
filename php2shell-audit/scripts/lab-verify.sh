@@ -326,6 +326,31 @@ expect "rce asset mismatch -> RCE-INCONCLUSIVE" "RCE-INCONCLUSIVE" "$rce_asset_s
   --asset lab-01 --seen-file "$RCE/seen-human.json" > "$RCE/human.out" 2>/dev/null
 expect "rce human mode prints state" "yes" "$(grep -q 'RCE STATE: RCE-CONFIRMED' "$RCE/human.out" && echo yes || echo no)"
 
+# ---- reproduction report integration (offline pipeline fixture) --------------
+# This fixture tests report rendering only. It is not a real lab result and
+# must not be presented as exploitation evidence.
+cat > "$tmpdir/repro-findings.jsonl" <<'EOF'
+{"asset":"lab-repro","priority":"P0","status":"vulnerable","sapi":"mod_php","version":"8.4.26","gate":"8.4.27","notes":"offline report fixture only","evidence":[{"type":"lab-reproduction","output":{"state":"REPRO-OOM-DIFFERENTIAL","observations":{"vulnerable":{"oom_detected":true,"normal_detected":false},"patched":{"oom_detected":false,"normal_detected":true},"execution_effects":[],"rce_observed":false}}}],"repro_state":"REPRO-OOM-DIFFERENTIAL","rce_state":""}
+EOF
+python3 "$HERE/report.py" --input "$tmpdir/repro-findings.jsonl" \
+  --md "$tmpdir/repro-report.md" --csv "$tmpdir/repro-findings.csv" >/dev/null 2>&1
+expect "report includes reproduction state" "yes" \
+  "$(grep -q 'REPRO-OOM-DIFFERENTIAL' "$tmpdir/repro-report.md" && echo yes || echo no)"
+expect "report includes reproduction section" "yes" \
+  "$(grep -q '## Reproduction evidence' "$tmpdir/repro-report.md" && echo yes || echo no)"
+expect "reproduction report does not claim RCE" "yes" \
+  "$(grep -q '| RCE-CONFIRMED |' "$tmpdir/repro-report.md" && echo no || echo yes)"
+expect "CSV includes repro_state" "yes" \
+  "$(head -1 "$tmpdir/repro-findings.csv" | grep -q 'repro_state' && echo yes || echo no)"
+
+cat > "$tmpdir/repro-noevidence.jsonl" <<'EOF'
+{"asset":"lab-repro-noev","priority":"P0","status":"vulnerable","repro_state":"REPRO-OOM-DIFFERENTIAL"}
+EOF
+python3 "$HERE/report.py" --input "$tmpdir/repro-noevidence.jsonl" \
+  --md "$tmpdir/repro-noevidence.md" >/dev/null 2>&1
+expect "report flags reproduction state without evidence" "yes" \
+  "$(grep -q 'reproduction state without evidence' "$tmpdir/repro-noevidence.md" && echo yes || echo no)"
+
 # ---- end-to-end orchestration ------------------------------------------------
 if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   S3="$(run_server 18093 "PHP/8.4.26" 200)"
@@ -338,6 +363,17 @@ if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     "$(grep -q 'RCE-CONFIRMED' "$tmpdir/audit/report.md" 2>/dev/null && echo yes || echo no)"
   expect "run-audit CSV produced" "yes" \
     "$([[ -s "$tmpdir/audit/findings.csv" ]] && echo yes || echo no)"
+
+  # A reproduction state that contradicts its own observations must not be
+  # trusted. This is an offline rejection fixture, not a real lab result.
+  cat > "$tmpdir/repro-inconsistent.json" <<'EOF'
+{"kind":"lab-reproduction","schema":1,"asset":"lab-01","state":"REPRO-OOM-DIFFERENTIAL","request":{"method":"POST"},"images":{"vulnerable":{"ref":"fixture"},"patched":{"ref":"fixture"}},"observations":{"vulnerable":{"oom_detected":false},"patched":{"oom_detected":false},"execution_effects":[],"rce_observed":false}}
+EOF
+  "$HERE/run-audit.sh" --url http://127.0.0.1:18093/ --out "$tmpdir/audit-repro-bad" \
+    --asset lab-01 --repro-evidence "$tmpdir/repro-inconsistent.json" \
+    > "$tmpdir/audit-repro-bad.log" 2>&1
+  expect "run-audit rejects inconsistent repro state" "REPRO-INCONCLUSIVE" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repro_state"])' "$tmpdir/audit-repro-bad/findings.jsonl" 2>/dev/null)"
   stop_server "$S3"
 fi
 

@@ -14,6 +14,14 @@ from collections import Counter
 from datetime import datetime, timezone
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "PATCHED": 4, "UNKNOWN": 5}
+REPRO_STATES = {
+    "REPRO-OOM-DIFFERENTIAL",
+    "REPRO-FATAL-BOTH",
+    "REPRO-NO-EFFECT",
+    "REPRO-CRASH-OBSERVED",
+    "REPRO-UNAVAILABLE",
+    "REPRO-INCONCLUSIVE",
+}
 
 
 def load(path: str) -> list[dict]:
@@ -77,6 +85,46 @@ def normalize(record: dict) -> dict:
         flags.append("RCE confirmed without evidence")
     if rce_state == "RCE-CONFIRMED" and priority == "PATCHED":
         flags.append("RCE confirmed but marked patched")
+
+    repro_state = first(record, "repro_state", default="").upper()
+    repro_obj = record.get("repro") if isinstance(record.get("repro"), dict) else None
+    if repro_obj is None:
+        for item in evidence:
+            if isinstance(item, dict) and item.get("type") == "lab-reproduction":
+                output = item.get("output")
+                if isinstance(output, dict):
+                    repro_obj = output
+                break
+    if repro_state and repro_state not in REPRO_STATES:
+        flags.append("unknown reproduction state")
+    if repro_state and not repro_obj:
+        flags.append("reproduction state without evidence")
+    if repro_state == "REPRO-OOM-DIFFERENTIAL" and priority == "PATCHED":
+        flags.append("reproduction differential but marked patched")
+
+    repro_vulnerable = ""
+    repro_patched = ""
+    repro_effects: list[str] = []
+    if repro_obj:
+        obs = repro_obj.get("observations") if isinstance(repro_obj.get("observations"), dict) else {}
+        vuln = obs.get("vulnerable") if isinstance(obs.get("vulnerable"), dict) else {}
+        patched = obs.get("patched") if isinstance(obs.get("patched"), dict) else {}
+        repro_vulnerable = observation_label(vuln)
+        repro_patched = observation_label(patched)
+        if repro_state == "REPRO-UNAVAILABLE":
+            repro_vulnerable = "unavailable"
+            repro_patched = "unavailable"
+        effects = obs.get("execution_effects") or []
+        if isinstance(effects, list):
+            repro_effects = [str(effect) for effect in effects]
+    repro_summary = first(record, "repro_summary", default="")
+    if not repro_summary and repro_obj:
+        repro_summary = (
+            f"vulnerable={repro_vulnerable or 'unknown'}; "
+            f"patched={repro_patched or 'unknown'}; "
+            f"execution_effects={', '.join(repro_effects) or 'none'}"
+        )
+
     return {
         "asset": first(record, "asset", "host", default="unknown"),
         "priority": priority,
@@ -88,6 +136,11 @@ def normalize(record: dict) -> dict:
         "owner": first(record, "owner", default=""),
         "remediation": first(record, "remediation", default=""),
         "verified_at": first(record, "verified_at", "checked_at", default=""),
+        "repro_state": repro_state,
+        "repro_summary": repro_summary,
+        "repro_vulnerable": repro_vulnerable,
+        "repro_patched": repro_patched,
+        "repro_effects": repro_effects,
         "rce_state": rce_state,
         "evidence_count": len(evidence),
         "interim_count": len(interim) if isinstance(interim, dict) else 0,
@@ -97,6 +150,16 @@ def normalize(record: dict) -> dict:
     }
 
 
+def observation_label(obs: dict) -> str:
+    if obs.get("oom_detected"):
+        return "OOM"
+    if obs.get("crash_signal"):
+        return "crash"
+    if obs.get("normal_detected"):
+        return "normal"
+    return "no effect/unknown"
+
+
 def sort_key(row: dict) -> tuple:
     return (PRIORITY_ORDER.get(row["priority"], 9), row["asset"])
 
@@ -104,6 +167,7 @@ def sort_key(row: dict) -> tuple:
 def build_markdown(rows: list[dict], title: str) -> str:
     counts = Counter(row["priority"] for row in rows)
     rce_counts = Counter(row["rce_state"] for row in rows if row["rce_state"])
+    repro_counts = Counter(row["repro_state"] for row in rows if row["repro_state"])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"# {title}",
@@ -116,6 +180,12 @@ def build_markdown(rows: list[dict], title: str) -> str:
         f"**Patched:** {counts.get('PATCHED', 0)}",
         "",
     ]
+    if repro_counts:
+        lines.append(
+            "**Reproduction:** "
+            + " · ".join(f"{state}={number}" for state, number in sorted(repro_counts.items()))
+        )
+        lines.append("")
     if rce_counts:
         lines.append(
             "**RCE:** "
@@ -125,18 +195,41 @@ def build_markdown(rows: list[dict], title: str) -> str:
     lines += [
         "## Findings",
         "",
-        "| Priority | Asset | SAPI | Version | Gate | Status | RCE | Exposure | Owner | Evidence | Flags |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Priority | Asset | SAPI | Version | Gate | Status | Repro | RCE | Exposure | Owner | Evidence | Flags |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in sorted(rows, key=sort_key):
         flags = "; ".join(row["flags"])
         values = dict(row)
         values["flags"] = flags
+        values["repro"] = values.get("repro_state") or "—"
         values["rce"] = values.get("rce_state") or "—"
         lines.append(
             "| {priority} | {asset} | {sapi} | {version} | {gate} | {status} | "
-            "{rce} | {exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
+            "{repro} | {rce} | {exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
         )
+    if repro_counts:
+        lines += [
+            "",
+            "## Reproduction evidence",
+            "",
+            "| Asset | State | Vulnerable | Patched | Execution effects |",
+            "|---|---|---|---|---|",
+        ]
+        for row in sorted(rows, key=sort_key):
+            if not row["repro_state"]:
+                continue
+            effects = ", ".join(row["repro_effects"]) or "none"
+            lines.append(
+                f"| {row['asset']} | {row['repro_state']} | "
+                f"{row['repro_vulnerable'] or '—'} | {row['repro_patched'] or '—'} | {effects} |"
+            )
+        lines += [
+            "",
+            "An OOM or crash differential is **not** proof of RCE. `RCE-CONFIRMED` still",
+            "requires execution effects, a fresh nonce, a matching marker, and the",
+            "`rce-validate.sh` artifact. See `references/lab-reproduction.md`.",
+        ]
     lines += ["", "## Remediation", ""]
     for row in sorted(rows, key=sort_key):
         if row["priority"] in ("P0", "P1", "P2"):
@@ -148,8 +241,9 @@ def build_markdown(rows: list[dict], title: str) -> str:
 def build_csv(rows: list[dict], path: str) -> None:
     fields = [
         "asset", "priority", "status", "sapi", "version", "gate",
-        "rce_state", "exposure", "owner", "remediation", "verified_at",
-        "evidence_count", "interim_count", "edge_count", "flags",
+        "repro_state", "repro_summary", "rce_state", "exposure", "owner",
+        "remediation", "verified_at", "evidence_count", "interim_count",
+        "edge_count", "flags",
     ]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)

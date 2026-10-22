@@ -3,10 +3,13 @@
 #
 # Pipeline:
 #   fingerprint -> edge conformance -> optional host triage/hardening
-#   -> chain verdict -> optional RCE evidence validation -> report
+#   -> chain verdict -> optional lab-reproduction evidence
+#   -> optional RCE evidence validation -> report
 #
-# The RCE stage validates an artifact from an authorized validation module.
-# It does not generate or send an exploit payload.
+# The reproduction stage consumes evidence from scripts/lab-repro.sh (a real,
+# bounded OOM/crash differential). The RCE stage validates an artifact from an
+# authorized validation module. Neither stage generates or sends an exploit
+# payload.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -18,6 +21,7 @@ LOCAL=0
 SSH_HOST=""
 DEEP=0
 RCE_EVIDENCE=""
+REPRO_EVIDENCE=""
 MARKERS=""
 EXPOSURE="unknown"
 
@@ -36,13 +40,14 @@ Options:
   --local               Also collect local triage/hardening evidence
   --host user@host      Also collect triage evidence over SSH
   --deep                With --local/--host, run inventory as well
+  --repro-evidence FILE Optional lab-reproduction evidence (see references/lab-reproduction.md)
   --rce-evidence FILE   Optional RCE evidence artifact (see references/rce-validation.md)
   --markers FILE        Optional marker file for RCE validation
   -h, --help            Show this help
 
 Artifacts:
   fingerprint.json  edge.json  chain.json  triage.jsonl  hardening.jsonl
-  rce.json          findings.jsonl  report.md  findings.csv
+  repro.json  rce.json  findings.jsonl  report.md  findings.csv
 
 Exit codes: 0 report generated, 2 setup/stage failure.
 EOF
@@ -58,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --local) LOCAL=1; shift ;;
     --host) SSH_HOST="${2:-}"; shift 2 ;;
     --deep) DEEP=1; shift ;;
+    --repro-evidence) REPRO_EVIDENCE="${2:-}"; shift 2 ;;
     --rce-evidence) RCE_EVIDENCE="${2:-}"; shift 2 ;;
     --markers) MARKERS="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -111,7 +117,86 @@ chain_args=()
 "$HERE/chain.sh" "${chain_args[@]}" --asset "$ASSET" --json > "$OUT/chain.json" 2> "$OUT/chain.err" || true
 log "chain: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("decision","?"))' "$OUT/chain.json" 2>/dev/null || echo failed)"
 
-# 5. RCE evidence validation (optional).
+# 5. Lab reproduction evidence (optional).
+if [[ -n "$REPRO_EVIDENCE" ]]; then
+  if [[ ! -f "$REPRO_EVIDENCE" ]]; then
+    echo "reproduction evidence not found: $REPRO_EVIDENCE" >&2
+    exit 2
+  fi
+  python3 - "$REPRO_EVIDENCE" "$OUT/repro.json" "$ASSET" <<'PY'
+import json, os, sys
+
+source, dest, audit_asset = sys.argv[1:4]
+ALLOWED = {
+    "REPRO-OOM-DIFFERENTIAL", "REPRO-FATAL-BOTH", "REPRO-NO-EFFECT",
+    "REPRO-CRASH-OBSERVED", "REPRO-UNAVAILABLE", "REPRO-INCONCLUSIVE",
+}
+reasons = []
+try:
+    with open(source, encoding="utf-8", errors="replace") as fh:
+        ev = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    ev = {}
+    reasons.append(f"cannot read reproduction evidence: {exc}")
+if not isinstance(ev, dict):
+    ev = {}
+    reasons.append("reproduction evidence root is not a JSON object")
+
+state = str(ev.get("state", "")).strip().upper()
+if ev.get("kind") != "lab-reproduction":
+    reasons.append("kind must be 'lab-reproduction'")
+if ev.get("schema") != 1:
+    reasons.append("schema must be 1")
+if state not in ALLOWED:
+    reasons.append(f"state is {state or 'missing'}; expected one of {sorted(ALLOWED)}")
+if state != "REPRO-UNAVAILABLE":
+    if not isinstance(ev.get("request"), dict) or not ev.get("request"):
+        reasons.append("request metadata is missing")
+    if not isinstance(ev.get("images"), dict) or not ev.get("images"):
+        reasons.append("image provenance is missing")
+obs = ev.get("observations") if isinstance(ev.get("observations"), dict) else {}
+if not obs:
+    if state != "REPRO-UNAVAILABLE":
+        reasons.append("observations are missing")
+else:
+    if "execution_effects" not in obs or obs.get("execution_effects") != []:
+        reasons.append("lab-reproduction evidence must have empty execution_effects")
+    if obs.get("rce_observed") is not False:
+        reasons.append("lab-reproduction evidence must set rce_observed=false")
+    v = obs.get("vulnerable") if isinstance(obs.get("vulnerable"), dict) else {}
+    p = obs.get("patched") if isinstance(obs.get("patched"), dict) else {}
+    if state in {"REPRO-OOM-DIFFERENTIAL", "REPRO-FATAL-BOTH", "REPRO-NO-EFFECT", "REPRO-CRASH-OBSERVED"}:
+        if not v or not p:
+            reasons.append("vulnerable and patched observations are required for this state")
+        v_oom = bool(v.get("oom_detected"))
+        p_oom = bool(p.get("oom_detected"))
+        p_normal = bool(p.get("normal_detected"))
+        crash = bool(v.get("crash_signal") or p.get("crash_signal"))
+        expected = (
+            "REPRO-CRASH-OBSERVED" if crash else
+            "REPRO-OOM-DIFFERENTIAL" if v_oom and not p_oom and p_normal else
+            "REPRO-FATAL-BOTH" if v_oom and p_oom else
+            "REPRO-NO-EFFECT" if not v_oom and not p_oom else
+            "REPRO-INCONCLUSIVE"
+        )
+        if state != expected:
+            reasons.append(f"state {state} does not match observations (expected {expected})")
+ev_asset = str(ev.get("asset") or "").strip()
+if ev_asset and ev_asset != audit_asset:
+    reasons.append(f"evidence asset '{ev_asset}' does not match audit asset '{audit_asset}'")
+
+out = dict(ev)
+out["state"] = state if not reasons else "REPRO-INCONCLUSIVE"
+out["source"] = source
+out["validation"] = {"consistent": not reasons, "reasons": reasons}
+with open(dest, "w", encoding="utf-8") as fh:
+    json.dump(out, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+PY
+  log "repro: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("state","?"))' "$OUT/repro.json" 2>/dev/null || echo failed)"
+fi
+
+# 6. RCE evidence validation (optional).
 if [[ -n "$RCE_EVIDENCE" ]]; then
   rce_args=(--evidence "$RCE_EVIDENCE" --asset "$ASSET" --seen-file "$OUT/.rce-seen.json" --json)
   [[ -n "$MARKERS" ]] && rce_args+=(--markers "$MARKERS")
@@ -119,7 +204,7 @@ if [[ -n "$RCE_EVIDENCE" ]]; then
   log "rce: $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("state","?"))' "$OUT/rce.json" 2>/dev/null || echo failed)"
 fi
 
-# 6. Normalize into one finding record.
+# 7. Normalize into one finding record.
 python3 - "$OUT" "$ASSET" "$EXPOSURE" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
@@ -138,6 +223,7 @@ def load(name):
 chain = load("chain.json") or {}
 fp = load("fingerprint.json") or {}
 edge = load("edge.json") or {}
+repro = load("repro.json") or {}
 rce = load("rce.json") or {}
 inventory = load("inventory.jsonl") or None
 
@@ -187,6 +273,27 @@ if rce_state == "RCE-CONFIRMED":
 elif rce_state == "RCE-BLOCKED":
     remediation = "Validation blocked by patch or a decisive control; maintain it."
 
+repro_state = repro.get("state", "")
+repro_summary = ""
+if repro_state:
+    repro_obs = repro.get("observations") if isinstance(repro.get("observations"), dict) else {}
+    rv = repro_obs.get("vulnerable") if isinstance(repro_obs.get("vulnerable"), dict) else {}
+    rp = repro_obs.get("patched") if isinstance(repro_obs.get("patched"), dict) else {}
+    def obs_label(item):
+        if item.get("oom_detected"):
+            return "OOM"
+        if item.get("normal_detected"):
+            return "normal"
+        if item.get("crash_signal"):
+            return "crash"
+        return "unknown"
+    if repro_state == "REPRO-UNAVAILABLE":
+        repro_summary = "runtime unavailable; no request sent; no execution effects"
+    else:
+        repro_summary = f"vulnerable={obs_label(rv)}; patched={obs_label(rp)}; no execution effects"
+    if repro_state == "REPRO-OOM-DIFFERENTIAL":
+        remediation += " Request-parsing OOM differential reproduced; patch is still required."
+
 evidence = []
 if fp:
     evidence.append({"type": "fingerprint", "output": fp})
@@ -196,6 +303,8 @@ if chain:
     evidence.append({"type": "chain", "output": chain})
 if inventory:
     evidence.append({"type": "inventory", "output": inventory})
+if repro:
+    evidence.append({"type": "lab-reproduction", "output": repro})
 if rce:
     evidence.append({"type": "rce-validation", "output": rce})
 
@@ -209,7 +318,9 @@ record = {
     "exposure": exposure,
     "owner": "",
     "evidence": evidence,
-    "remediation": remediation,
+    "remediation": remediation.strip(),
+    "repro_state": repro_state,
+    "repro_summary": repro_summary,
     "rce_state": rce_state,
     "verified_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
@@ -217,7 +328,7 @@ with open(os.path.join(out, "findings.jsonl"), "w", encoding="utf-8") as fh:
     fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 PY
 
-# 7. Report.
+# 8. Report.
 python3 "$HERE/report.py" --input "$OUT/findings.jsonl" \
   --md "$OUT/report.md" --csv "$OUT/findings.csv" \
   --title "PHP2Shell audit — $ASSET" 2> "$OUT/report.log" || {

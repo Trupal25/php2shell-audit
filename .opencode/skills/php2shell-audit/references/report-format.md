@@ -40,6 +40,8 @@
   ],
   "remediation": "Rebuild image on php:8.4.27-fpm; keep interim controls; redeploy.",
   "verified_at": "2026-10-22T10:05:00Z",
+  "repro_state": "REPRO-OOM-DIFFERENTIAL",
+  "repro_summary": "vulnerable=OOM; patched=normal; no execution effects",
   "rce_state": "RCE-NOT-REPRODUCED",
   "notes": "Staging pool only; production pool still on 8.4.26."
 }
@@ -52,6 +54,8 @@ Field rules:
 - `priority`: `P0` | `P1` | `P2` | `P3`.
 - `patched_min`: branch gate (`8.2.35`, `8.3.36`, `8.4.27`, `8.5.12`); `null` for EOL.
 - `rce_state` (optional): `RCE-CONFIRMED` | `RCE-NOT-REPRODUCED` | `RCE-INCONCLUSIVE` | `RCE-BLOCKED`. Omit it if no RCE evidence was validated; do not infer it from a version banner.
+- `repro_state` (optional): `REPRO-OOM-DIFFERENTIAL` | `REPRO-FATAL-BOTH` | `REPRO-NO-EFFECT` | `REPRO-CRASH-OBSERVED` | `REPRO-UNAVAILABLE` | `REPRO-INCONCLUSIVE`. This is a separate lab-reproduction observation, never an RCE claim.
+- `repro_summary` (optional): short observed summary, e.g. `vulnerable=OOM; patched=normal; no execution effects`.
 - `evidence`: at least one reproducible command per claim. No evidence, no finding.
 
 ### RCE evidence fields
@@ -64,6 +68,15 @@ A `RCE-CONFIRMED` claim must carry the validator artifact and the marker path. S
 
 Never upgrade a suspected exposure to `RCE-CONFIRMED` because of `X-Powered-By`, a
 version string, or an edge probe.
+
+### Lab reproduction fields
+
+A `repro_state` comes from `scripts/lab-repro.sh` and its
+`references/lab-reproduction.md` schema. It records what the vulnerable and
+patched Apache/mod_php containers actually did on one bounded request. It does
+not imply execution. `report.py` flags reproduction states without evidence and
+a differential that is marked patched. `RCE-CONFIRMED` still requires the
+separate `rce-validation` artifact.
 
 ## 2. Markdown report template
 
@@ -82,9 +95,9 @@ version string, or an edge probe.
 
 ## Patch state
 
-| Asset | SAPI | Version | Gate | Status | RCE | Exposure | Priority |
-|---|---|---|---|---|---|---|---|
-| ... | ... | ... | ... | ... | ... | ... | ... |
+| Asset | SAPI | Version | Gate | Status | Repro | RCE | Exposure | Priority |
+|---|---|---|---|---|---|---|---|---|
+| ... | ... | ... | ... | ... | ... | ... | ... | ... |
 
 ## P0/P1 findings
 
@@ -143,7 +156,34 @@ version string, or an edge probe.
 <Paths to JSONL, logs, screenshots, curl transcripts.>
 ```
 
-## 3. RCE evidence (optional)
+## 3. Lab reproduction evidence (optional)
+
+Only include this section when `lab-repro.sh` has produced a state:
+
+```markdown
+## Reproduction evidence
+
+| Asset | State | Vulnerable | Patched | Execution effects |
+|---|---|---|---|---|
+| lab-vulnerable | REPRO-OOM-DIFFERENTIAL | OOM | normal | none |
+
+An OOM or crash differential is not proof of RCE. `RCE-CONFIRMED` still requires
+a separate `rce-validation` artifact with execution effects, a fresh nonce, and
+a matching marker.
+```
+
+- `REPRO-OOM-DIFFERENTIAL` means the vulnerable build exhausted memory in the
+  parser and the patched build returned normally. It proves a behavior
+  difference, not exploitation.
+- `REPRO-CRASH-OBSERVED` means a worker crash signal was captured. It is still
+  not RCE.
+- `REPRO-FATAL-BOTH`, `REPRO-NO-EFFECT`, and `REPRO-INCONCLUSIVE` mean there is
+  no usable differential; report them as such.
+- `REPRO-UNAVAILABLE` means Docker, an image, a tool, or container readiness was
+  missing; no request was sent.
+- See `references/lab-reproduction.md` for the schema and boundary.
+
+## 4. RCE evidence (optional)
 
 Only include this section when `rce-validate.sh` has produced a state:
 
@@ -165,7 +205,7 @@ Only include this section when `rce-validate.sh` has produced a state:
 - The trigger/heap-grooming chain is not part of this repository. See
   `references/rce-validation.md`.
 
-## 4. Scoring rubric alignment
+## 5. Scoring rubric alignment
 
 Use this to prioritize work and to make the report easy to grade.
 
@@ -190,7 +230,7 @@ Deductions:
 - Claiming RCE from a version banner or an edge probe.
 - Publishing `RCE-CONFIRMED` without the validator artifact and marker.
 
-## 5. Fast aggregation
+## 6. Fast aggregation
 
 ```bash
 # JSONL → CSV for a spreadsheet

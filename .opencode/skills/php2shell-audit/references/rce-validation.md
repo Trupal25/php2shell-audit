@@ -23,6 +23,12 @@ working trigger against a specific PHP build and SAPI, plus a heap layout that
 survives the target's allocator behavior. A reliable trigger is exploit code. This
 repository does not contain one, does not generate one, and does not send one.
 
+A separate, non-RCE reproduction is available in `scripts/lab-repro.sh` and
+`references/lab-reproduction.md`. It runs the real vulnerable/patched Apache pair
+and records a request-parsing OOM differential. That artifact is for the
+`repro_state` field, **not** for `rce_state`; it always has empty execution
+effects and cannot reach `RCE-CONFIRMED`.
+
 Consequences:
 
 - The pipeline **cannot** reach `RCE-CONFIRMED` on its own. It reaches
@@ -208,9 +214,20 @@ trigger or for human review of the execution proof.
 - Missing `--markers` → inconclusive.
 - Human-readable output.
 - End-to-end `run-audit.sh` → `report.md` with `RCE-CONFIRMED` and CSV output.
+- Offline reproduction-report rendering (state, section, no RCE claim, CSV field).
 
-Run it offline; no PHP, Docker, or internet is required:
+`scripts/lab-integration.sh` is separate and Docker-gated. It runs the real
+`lab-repro.sh` differential, feeds the artifact to `run-audit.sh`, and asserts
+the report shows `REPRO-OOM-DIFFERENTIAL` and not `RCE-CONFIRMED`.
+
+Run the offline suite; no PHP, Docker, or internet is required:
 
 ```bash
 bash scripts/lab-verify.sh
+```
+
+Run the integration suite only with Docker and both images available:
+
+```bash
+bash scripts/lab-integration.sh --out lab-integration-1
 ```
