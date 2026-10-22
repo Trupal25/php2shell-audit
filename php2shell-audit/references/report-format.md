@@ -43,6 +43,16 @@
   "repro_state": "REPRO-OOM-DIFFERENTIAL",
   "repro_summary": "vulnerable=OOM; patched=normal; no execution effects",
   "rce_state": "RCE-NOT-REPRODUCED",
+  "impact": "crash-oom",
+  "impact_confidence": "observed",
+  "impact_applicable": true,
+  "impact_basis": ["vulnerable target exhausted memory; patched control did not"],
+  "validation_impact": "crash-oom",
+  "validation_confidence": "observed",
+  "validation_synthetic": false,
+  "validation_summary": "oom-differential: crash-oom (observed)",
+  "module_id": "oom-differential",
+  "module_state": "completed",
   "notes": "Staging pool only; production pool still on 8.4.26."
 }
 ```
@@ -56,6 +66,12 @@ Field rules:
 - `rce_state` (optional): `RCE-CONFIRMED` | `RCE-NOT-REPRODUCED` | `RCE-INCONCLUSIVE` | `RCE-BLOCKED`. Omit it if no RCE evidence was validated; do not infer it from a version banner.
 - `repro_state` (optional): `REPRO-OOM-DIFFERENTIAL` | `REPRO-FATAL-BOTH` | `REPRO-NO-EFFECT` | `REPRO-CRASH-OBSERVED` | `REPRO-UNAVAILABLE` | `REPRO-INCONCLUSIVE`. This is a separate lab-reproduction observation, never an RCE claim.
 - `repro_summary` (optional): short observed summary, e.g. `vulnerable=OOM; patched=normal; no execution effects`.
+- `impact` (optional): `suspected-exposure` | `crash-oom` | `memory-safety-failure` | `memory-disclosure` | `demonstrated-code-execution` | `inconclusive`. This is the **target** impact after evidence normalization.
+- `impact_confidence` (optional): `exposure-only` | `observed` | `corroborated` | `insufficient`.
+- `impact_applicable` (optional): boolean; false when the target meets the patch gate, so lab validation is not target impact.
+- `impact_basis` (optional): array of short strings naming the evidence that supports the impact.
+- `validation_impact` / `validation_confidence` / `validation_synthetic` / `validation_summary` (optional): what the executed or consumed validation module classified, kept separate from the target impact.
+- `module_id` / `module_state` (optional): module identity and `completed` | `failed` | `timeout` | `unavailable`.
 - `evidence`: at least one reproducible command per claim. No evidence, no finding.
 
 ### RCE evidence fields
@@ -77,6 +93,26 @@ patched Apache/mod_php containers actually did on one bounded request. It does
 not imply execution. `report.py` flags reproduction states without evidence and
 a differential that is marked patched. `RCE-CONFIRMED` still requires the
 separate `rce-validation` artifact.
+
+### Validation-module impact fields
+
+A validation module run (`scripts/module-run.sh`) contributes
+`validation_impact` and the related fields; it does not replace `rce_state` or
+`repro_state`. The module's self-reported JSON is a claim until the harness
+corroborates it. `report.py` flags:
+
+- `execution impact without RCE-CONFIRMED` — an execution claim without the
+  validator.
+- `synthetic validation module (not evidence)` — the fixture is never evidence.
+- `validation impact without verified artifacts` — hashes or proof are missing.
+- `module did not complete but validation impact claimed`.
+- `lab validation applies to vulnerable build, not this patched target`.
+
+The target `impact` is chosen conservatively: verified non-synthetic module
+evidence is a candidate only when the target is below the gate; a synthetic or
+unverified claim is ignored; `crash-oom`/`memory-safety-failure`/`memory-disclosure`
+remain distinct from `demonstrated-code-execution`; and an OOM is never promoted
+to memory corruption or RCE. Full contract: `references/module-interface.md`.
 
 ### URL assessment artifact (`assessment.json`)
 

@@ -14,6 +14,21 @@ from collections import Counter
 from datetime import datetime, timezone
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "PATCHED": 4, "UNKNOWN": 5}
+IMPACT_ORDER = {
+    "inconclusive": 0,
+    "suspected-exposure": 1,
+    "crash-oom": 2,
+    "memory-safety-failure": 3,
+    "memory-disclosure": 4,
+    "demonstrated-code-execution": 5,
+}
+IMPACTS = tuple(IMPACT_ORDER)
+STRONG_IMPACTS = {
+    "crash-oom",
+    "memory-safety-failure",
+    "memory-disclosure",
+    "demonstrated-code-execution",
+}
 REPRO_STATES = {
     "REPRO-OOM-DIFFERENTIAL",
     "REPRO-FATAL-BOTH",
@@ -125,6 +140,99 @@ def normalize(record: dict) -> dict:
             f"execution_effects={', '.join(repro_effects) or 'none'}"
         )
 
+    # Validation-module evidence. The record's impact fields are authoritative;
+    # older records fall back to the same conservative derivation used by
+    # run-audit.sh.
+    module_run = record.get("module_run") if isinstance(record.get("module_run"), dict) else None
+    if module_run is None:
+        for item in evidence:
+            if isinstance(item, dict) and item.get("type") == "validation-module-run":
+                output = item.get("output")
+                if isinstance(output, dict):
+                    module_run = output
+                break
+    module_run = module_run or {}
+    module_cls = module_run.get("classification") if isinstance(module_run.get("classification"), dict) else {}
+    module = module_run.get("module") if isinstance(module_run.get("module"), dict) else {}
+    module_id = first(record, "module_id", default="") or str(module.get("id") or "")
+    module_synthetic = bool(record.get("validation_synthetic") or module_run.get("synthetic") or module_cls.get("synthetic"))
+    module_state = str(module_run.get("state") or record.get("module_state") or "")
+    validation_impact = first(record, "validation_impact", default="") or str(module_cls.get("impact") or "")
+    validation_impact = validation_impact if validation_impact in IMPACT_ORDER else ""
+    validation_confidence = first(record, "validation_confidence", default="") or str(module_cls.get("confidence") or "")
+    checks = module_cls.get("checks") if isinstance(module_cls.get("checks"), dict) else {}
+    arts = checks.get("artifacts_verified") if isinstance(checks.get("artifacts_verified"), dict) else {}
+    try:
+        declared_arts = int(arts.get("declared") or 0)
+        verified_arts = int(arts.get("verified") or 0)
+    except (TypeError, ValueError):
+        declared_arts, verified_arts = 0, 0
+    corr = module_cls.get("corroboration") if isinstance(module_cls.get("corroboration"), dict) else {}
+    module_verified = bool(corr.get("execution_corroborated")) or (
+        declared_arts > 0 and verified_arts == declared_arts
+    )
+    module_negative = module_cls.get("negative_controls") if isinstance(module_cls.get("negative_controls"), dict) else {}
+    module_reproduction = module_cls.get("reproduction_steps") if isinstance(module_cls.get("reproduction_steps"), list) else []
+    module_env = module_cls.get("environment_dependencies") if isinstance(module_cls.get("environment_dependencies"), list) else []
+    module_limitations = module_cls.get("limitations") if isinstance(module_cls.get("limitations"), list) else []
+    module_evidence_refs = module_cls.get("evidence_refs") if isinstance(module_cls.get("evidence_refs"), list) else []
+    module_obs = module_run.get("harness_observations") if isinstance(module_run.get("harness_observations"), dict) else {}
+
+    impact = first(record, "impact", default="").lower()
+    if impact not in IMPACT_ORDER:
+        if rce_state == "RCE-CONFIRMED":
+            impact = "demonstrated-code-execution"
+        elif repro_state in ("REPRO-OOM-DIFFERENTIAL", "REPRO-CRASH-OBSERVED"):
+            impact = "crash-oom"
+        elif priority == "PATCHED":
+            impact = "inconclusive"
+        elif first(record, "status") == "vulnerable":
+            impact = "suspected-exposure"
+        else:
+            impact = "inconclusive"
+    impact_confidence = first(record, "impact_confidence", default="")
+    if not impact_confidence:
+        impact_confidence = {
+            "demonstrated-code-execution": "corroborated",
+            "memory-disclosure": "corroborated",
+            "memory-safety-failure": "observed",
+            "crash-oom": "observed",
+            "suspected-exposure": "exposure-only",
+            "inconclusive": "insufficient",
+        }.get(impact, "insufficient")
+    impact_basis = record.get("impact_basis") if isinstance(record.get("impact_basis"), list) else []
+    impact_basis = [str(item) for item in impact_basis]
+    impact_applicable = record.get("impact_applicable", True)
+    if isinstance(impact_applicable, str):
+        impact_applicable = impact_applicable.lower() not in ("false", "0", "no", "")
+    impact_applicable = bool(impact_applicable)
+
+    if impact == "demonstrated-code-execution" and rce_state != "RCE-CONFIRMED":
+        flags.append("execution impact without RCE-CONFIRMED")
+    if module_synthetic:
+        flags.append("synthetic validation module (not evidence)")
+        if validation_impact == "demonstrated-code-execution":
+            flags.append("synthetic fixture execution claim rejected")
+    if validation_impact in STRONG_IMPACTS and not module_verified and not module_synthetic:
+        flags.append("validation impact without verified artifacts")
+    if module_state in ("failed", "timeout", "unavailable") and validation_impact in STRONG_IMPACTS:
+        flags.append("module did not complete but validation impact claimed")
+    if priority == "PATCHED" and validation_impact in STRONG_IMPACTS:
+        flags.append("lab validation applies to vulnerable build, not this patched target")
+    if impact in STRONG_IMPACTS and priority == "PATCHED":
+        flags.append("impact claim but marked patched")
+
+    validation_summary = first(record, "validation_summary", default="")
+    if not validation_summary:
+        if module_id:
+            validation_summary = f"{module_id}: {validation_impact or 'inconclusive'} ({validation_confidence or 'insufficient'})"
+            if module_synthetic:
+                validation_summary += " [synthetic, not evidence]"
+            elif not module_verified and validation_impact in STRONG_IMPACTS:
+                validation_summary += " [artifacts unverified]"
+        else:
+            validation_summary = "no validation module executed"
+
     return {
         "asset": first(record, "asset", "host", default="unknown"),
         "priority": priority,
@@ -136,6 +244,27 @@ def normalize(record: dict) -> dict:
         "owner": first(record, "owner", default=""),
         "remediation": first(record, "remediation", default=""),
         "verified_at": first(record, "verified_at", "checked_at", default=""),
+        "impact": impact,
+        "impact_confidence": impact_confidence,
+        "impact_applicable": impact_applicable,
+        "impact_basis": impact_basis,
+        "module_id": module_id,
+        "module_state": module_state,
+        "module_synthetic": module_synthetic,
+        "module_verified": module_verified,
+        "validation_impact": validation_impact,
+        "validation_confidence": validation_confidence,
+        "validation_synthetic": module_synthetic,
+        "validation_summary": validation_summary,
+        "module_run": module_run,
+        "module_cls": module_cls,
+        "module_negative": module_negative,
+        "module_reproduction": module_reproduction,
+        "module_env": module_env,
+        "module_limitations": module_limitations,
+        "module_evidence_refs": module_evidence_refs,
+        "module_obs": module_obs,
+        "module_targets": module_run.get("targets") if isinstance(module_run.get("targets"), dict) else {},
         "repro_state": repro_state,
         "repro_summary": repro_summary,
         "repro_vulnerable": repro_vulnerable,
@@ -160,12 +289,17 @@ def observation_label(obs: dict) -> str:
     return "no effect/unknown"
 
 
+def md_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
 def sort_key(row: dict) -> tuple:
     return (PRIORITY_ORDER.get(row["priority"], 9), row["asset"])
 
 
 def build_markdown(rows: list[dict], title: str) -> str:
     counts = Counter(row["priority"] for row in rows)
+    impact_counts = Counter(row["impact"] for row in rows)
     rce_counts = Counter(row["rce_state"] for row in rows if row["rce_state"])
     repro_counts = Counter(row["repro_state"] for row in rows if row["repro_state"])
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -186,6 +320,17 @@ def build_markdown(rows: list[dict], title: str) -> str:
             + " · ".join(f"{state}={number}" for state, number in sorted(repro_counts.items()))
         )
         lines.append("")
+    if impact_counts:
+        lines.append(
+            "**Impact:** "
+            + " · ".join(
+                f"{impact}={number}"
+                for impact, number in sorted(
+                    impact_counts.items(), key=lambda item: IMPACT_ORDER.get(item[0], 9)
+                )
+            )
+        )
+        lines.append("")
     if rce_counts:
         lines.append(
             "**RCE:** "
@@ -195,8 +340,8 @@ def build_markdown(rows: list[dict], title: str) -> str:
     lines += [
         "## Findings",
         "",
-        "| Priority | Asset | SAPI | Version | Gate | Status | Repro | RCE | Exposure | Owner | Evidence | Flags |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Priority | Asset | SAPI | Version | Gate | Status | Impact | Validation | Repro | RCE | Exposure | Owner | Evidence | Flags |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in sorted(rows, key=sort_key):
         flags = "; ".join(row["flags"])
@@ -204,10 +349,94 @@ def build_markdown(rows: list[dict], title: str) -> str:
         values["flags"] = flags
         values["repro"] = values.get("repro_state") or "—"
         values["rce"] = values.get("rce_state") or "—"
+        values["impact"] = values.get("impact") or "inconclusive"
+        values["validation"] = md_cell(values.get("validation_summary") or "—")
         lines.append(
             "| {priority} | {asset} | {sapi} | {version} | {gate} | {status} | "
-            "{repro} | {rce} | {exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
+            "{impact} | {validation} | {repro} | {rce} | {exposure} | {owner} | {evidence_count} | {flags} |".format(**values)
         )
+
+    rows_with_module = [row for row in sorted(rows, key=sort_key) if row.get("module_run")]
+    lines += ["", "## Validation and impact", ""]
+    if not rows_with_module:
+        lines.append(
+            "No validation module was executed. Impacts are derived only from exposure, "
+            "reproduction, and RCE-validator evidence; no dynamic execution is claimed."
+        )
+    else:
+        lines += [
+            "| Asset | Target impact | Validation impact | Module | Synthetic | Verified | State | Negative control |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for row in rows_with_module:
+            neg = row.get("module_negative") or {}
+            neg_bits: list[str] = []
+            if "patched_oom" in neg:
+                neg_bits.append("patched OOM=" + ("yes" if neg.get("patched_oom") else "no"))
+            if "patched_normal_response" in neg:
+                neg_bits.append(
+                    "patched normal=" + ("yes" if neg.get("patched_normal_response") else "no")
+                )
+            if "patched_disclosure_canary" in neg:
+                neg_bits.append(
+                    "patched canary=" + ("yes" if neg.get("patched_disclosure_canary") else "no")
+                )
+            lines.append(
+                f"| {md_cell(row['asset'])} | {row['impact']} | {row['validation_impact'] or '—'} | "
+                f"{md_cell(row['module_id'] or '—')} | {'yes' if row['module_synthetic'] else 'no'} | "
+                f"{'yes' if row['module_verified'] else 'no'} | {md_cell(row['module_state'] or '—')} | "
+                f"{md_cell('; '.join(neg_bits) or '—')} |"
+            )
+
+        for row in rows_with_module:
+            lines += ["", f"### {row['asset']} — {row['impact']}", ""]
+            lines.append(
+                f"**Target impact:** {row['impact']} (confidence: {row['impact_confidence']}; "
+                f"applicable: {'yes' if row['impact_applicable'] else 'no'})"
+            )
+            if row.get("impact_basis"):
+                lines += ["", "**Basis:**"]
+                for item in row["impact_basis"]:
+                    lines.append(f"- {item}")
+            lines += [
+                "",
+                f"**Validation module:** `{row['module_id'] or 'unknown'}` "
+                f"(state: {row['module_state'] or 'unknown'}; "
+                f"synthetic: {'yes' if row['module_synthetic'] else 'no'}; "
+                f"artifacts verified: {'yes' if row['module_verified'] else 'no'})",
+                "",
+                f"**Demonstrated impact:** lab validation classified `{row['validation_impact'] or 'inconclusive'}` "
+                f"with confidence `{row['validation_confidence'] or 'insufficient'}`. "
+                f"The target impact is `{row['impact']}`.",
+            ]
+            if row.get("module_reproduction"):
+                lines += ["", "**Reproduction steps:**"]
+                for index, step in enumerate(row["module_reproduction"], 1):
+                    lines.append(f"{index}. {step}")
+            if row.get("module_evidence_refs"):
+                lines += ["", "**Evidence references:**"]
+                for ref in row["module_evidence_refs"]:
+                    lines.append(f"- `{ref}`")
+            if row.get("module_negative"):
+                lines += ["", "**Negative controls:**"]
+                for key, value in row["module_negative"].items():
+                    lines.append(f"- `{key}`: {value}")
+            if row.get("module_env"):
+                lines += ["", "**Environmental dependencies:**"]
+                for item in row["module_env"]:
+                    lines.append(f"- {item}")
+            if row.get("module_limitations"):
+                lines += ["", "**Limitations:**"]
+                for item in row["module_limitations"]:
+                    lines.append(f"- {item}")
+
+    lines += [
+        "",
+        "**Interpretation boundary:** an OOM or crash is not memory corruption or code "
+        "execution; a synthetic fixture is never evidence; "
+        "`demonstrated-code-execution` requires a corroborated target marker and an "
+        "`RCE-CONFIRMED` validator result.",
+    ]
     if repro_counts:
         lines += [
             "",
@@ -241,6 +470,9 @@ def build_markdown(rows: list[dict], title: str) -> str:
 def build_csv(rows: list[dict], path: str) -> None:
     fields = [
         "asset", "priority", "status", "sapi", "version", "gate",
+        "impact", "impact_confidence", "impact_applicable",
+        "validation_impact", "validation_confidence", "validation_synthetic",
+        "module_id", "module_state", "validation_summary",
         "repro_state", "repro_summary", "rce_state", "exposure", "owner",
         "remediation", "verified_at", "evidence_count", "interim_count",
         "edge_count", "flags",

@@ -1,0 +1,18 @@
+{
+  "kind": "php2shell-validation-module",
+  "schema": 1,
+  "id": "oom-differential",
+  "version": "1.0.0",
+  "description": "Bounded multipart request-parsing OOM differential against vulnerable and patched Apache/mod_php. Measures availability behavior only; never claims execution.",
+  "authorized_use": "isolated lab only; no production targets",
+  "runtime": {
+    "image": "php:8.4.27-apache",
+    "entrypoint": ["php", "-d", "memory_limit=-1", "/module/run.php"]
+  },
+  "output": "module-result.json",
+  "claims": {
+    "synthetic": false,
+    "max_impact": "crash-oom",
+    "surface": "multipart request parsing / session upload progress"
+  }
+}

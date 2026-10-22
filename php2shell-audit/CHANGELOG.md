@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.5.0 — 2026-10-22
+
+- `scripts/module-run.sh` (new): controlled execution harness for an external
+  validation module. It validates `module.json`, starts a disposable
+  `php:8.4.26-apache` / `php:8.4.27-apache` pair on an internal Docker network,
+  runs the module in a hardened `php:8.4.27-apache` container (`--cap-drop ALL`,
+  `no-new-privileges`, read-only root, tmpfs `/tmp`, memory/CPU/PID limits, no
+  published ports, no Docker socket), captures logs and response artifacts,
+  retrieves an optional target marker, bridges to `rce-validate.sh`, classifies
+  the observed impact, and records SHA-256 provenance. `--dry-run` validates and
+  prints the plan without Docker; `--keep` preserves the lab; the default cleans
+  up containers and the network.
+- `scripts/impact-classify.py` (new): conservative impact classifier and
+  manifest validator. Taxonomy: `suspected-exposure`, `crash-oom`,
+  `memory-safety-failure`, `memory-disclosure`,
+  `demonstrated-code-execution`, `inconclusive`. OOM needs harness/response
+  corroboration, disclosure needs a canary match, memory safety needs a
+  sanitizer/heap signal, and execution needs `RCE-CONFIRMED` plus an
+  independently retrieved target marker whose hash matches. A synthetic module
+  is always `inconclusive`.
+- `references/module-interface.md` (new): module contract, trust model,
+  input/result schema, execution/disclosure extensions, taxonomy, and harness
+  artifact schema.
+- `modules/oom-differential/` (new): real module that sends the upstream
+  150,000-header multipart shape and reports only the OOM differential.
+- `modules/synthetic-fixture/` (new): execution-claim fixture for testing the
+  trust boundary; it is refused without `--allow-synthetic` and is never
+  evidence.
+- `scripts/run-audit.sh`: `--module DIR` executes a module in the disposable lab;
+  `--module-run FILE|DIR` consumes an existing run artifact. Verified,
+  non-synthetic module evidence is normalized into `impact`; synthetic or
+  unverified claims are ignored; a patched target cannot be made to appear
+  vulnerable by lab validation.
+- `scripts/report.py`: `impact`, `impact_confidence`, `impact_applicable`,
+  `validation_impact`, `validation_confidence`, `validation_synthetic`,
+  `module_id`, `module_state`, `validation_summary`, plus `Impact`/`Validation`
+  columns, an impact summary, and a `## Validation and impact` section with
+  basis, reproduction steps, negative controls, environment, limitations, and
+  evidence references. New CSV fields match.
+- `scripts/lab-verify.sh`: 98 → 130 offline assertions. Adds classifier cases
+  (corroborated/uncorroborated OOM, memory safety, disclosure canary, validated
+  and rejected execution), manifest validation (kind, traversal, synthetic
+  gating), no-Docker dry-run, and `run-audit --module-run` consumption of
+  real-shaped and synthetic fixtures.
+- `scripts/lab-integration.sh`: 14 → 62 Docker assertions. Adds a real
+  `oom-differential` run, isolation/limit/network/port checks, provenance hashes,
+  cleanup and container/network removal checks, a repeatability run with the same
+  classification, and audit/report consumption of the real module artifact.
+- Demonstrated on 2026-10-22: `php:8.4.26-apache` OOMs on the bounded multipart
+  request (8 MB limit), `php:8.4.27-apache` returns the normal probe JSON,
+  classification `crash-oom` (`observed`). No crash, memory disclosure, or
+  execution was observed; the heap-grooming/execution trigger remains external.
+- Docs/version: README and SKILL gain the module workflow, impact taxonomy, and
+  boundary; VERSION → 1.5.0.
+
 ## 1.4.0 — 2026-10-22
 
 - `assess-url.sh`: full URL-based remote assessment workflow. One authorized URL
