@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+inventory.jsonl
+fleet.jsonl
+triage.jsonl
+report.md
+findings.csv
+scope.txt

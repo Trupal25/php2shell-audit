@@ -1,0 +1,19 @@
+services:
+  # Deliberately vulnerable version for version-gate validation only.
+  # Do not expose this port outside the lab network.
+  vulnerable:
+    image: php:8.4.26-apache
+    ports:
+      - "8081:80"
+    volumes:
+      - ./index.php:/var/www/html/index.php:ro
+    restart: "no"
+
+  # Patched pair for A/B verification of the audit output.
+  patched:
+    image: php:8.4.27-apache
+    ports:
+      - "8082:80"
+    volumes:
+      - ./index.php:/var/www/html/index.php:ro
+    restart: "no"

@@ -1,0 +1,7 @@
+# Authorized PHP2Shell audit targets
+# One host per line. Blank lines and # comments are ignored.
+# Only public targets need this file; private/loopback lab hosts run directly.
+#
+# web-01.lab.example
+# 10.20.30.40
+# *.lab.example
